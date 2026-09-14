@@ -37,6 +37,18 @@ not finish sooner, they just contend. So sasse batches instead:
 Common case is one gate run for the whole batch. Failure costs `log2(N)`
 additional rounds, and only when something is actually broken.
 
+## Repository layout
+
+The queue requires that **the base branch is checked out nowhere**. The
+integration checkout runs on a detached HEAD, and developers work on feature
+branches.
+
+That is not a style preference. Verified against git 2.55: `git update-ref` will
+move a branch that is checked out, in the current worktree or another one, with
+no warning and no refusal, leaving that checkout's index disagreeing with its
+HEAD so the entire difference appears as staged changes. Git does not protect
+this, so sasse refuses to move a base branch that any checkout holds.
+
 ## Invariants
 
 1. Merge exactly what was gated. The base is only ever fast-forwarded to the
@@ -73,9 +85,13 @@ Early. What exists:
 - `src/queue/lease.rs`, the single-worker lease: acquire or attach, renew
   against a fencing token, and reclaim a dead holder's lease along with the
   candidate it abandoned.
+- `src/git.rs` and `src/git/`, the git operations behind a trait, with a real
+  implementation over the `git` command and an in-memory fake for tests. A merge
+  conflict and a base branch that moved are returned as values, because both are
+  verdicts the queue acts on rather than failures.
 - `src/db.rs`, the migration runner.
 
-Not yet written: the git operations, the worker loop, and the CLI beyond
+Not yet written: the worker loop, the gate runner, and the CLI beyond
 `sasse migrate`.
 
 ## Development
