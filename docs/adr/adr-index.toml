@@ -1,0 +1,20 @@
+[meta]
+  project = "sasse"
+  created = "2026-09-14"
+  version = "2.0"
+  default_base = "main"
+
+[decisions]
+  [decisions.gate-provenance]
+    file = "gate-provenance.md"
+    type = "feat"
+    status = "accepted"
+    created = "2026-09-14"
+    author = "thoroc"
+    tags = []
+    description = "The worker reads its gate command from the base branch tip, not from the candidate under test"
+
+    [[decisions.gate-provenance.history]]
+      from = "proposed"
+      to = "accepted"
+      at = 2026-09-14T20:22:30.421101Z
