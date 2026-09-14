@@ -52,6 +52,10 @@ additional rounds, and only when something is actually broken.
    because a batch-mate failed requeues for free, so one flaky branch cannot
    drain the budget of everything batched alongside it.
 5. Queue state is persisted. A reboot mid-batch must not lose the queue.
+6. Exactly one worker integrates into a base branch at a time, held as a lease
+   with an expiry. Expiry is the authority, so a worker that wedges or dies
+   cannot hold a branch indefinitely, and a reclaim clears whatever it left
+   mid-gate rather than leaving the queue stuck.
 
 Invariants 1 and 3 are enforced by `CHECK` constraints and a partial unique
 index in the schema, not only by the worker, so a bug in the worker cannot leave
@@ -66,6 +70,9 @@ Early. What exists:
 - `src/queue/outcome.rs`, the per-candidate verdict for an entry, which decides
   whether a failure spends part of that entry's retry budget.
 - `src/queue/model.rs`, the bisection decision.
+- `src/queue/lease.rs`, the single-worker lease: acquire or attach, renew
+  against a fencing token, and reclaim a dead holder's lease along with the
+  candidate it abandoned.
 - `src/db.rs`, the migration runner.
 
 Not yet written: the git operations, the worker loop, and the CLI beyond

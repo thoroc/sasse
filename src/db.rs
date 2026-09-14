@@ -1,9 +1,13 @@
 use std::path::Path;
+use std::time::Duration;
 
 use eyre::{Result, WrapErr};
 use rusqlite::Connection;
 
-const MIGRATIONS: &[(i32, &str)] = &[(1, include_str!("../migrations/0001_init.sql"))];
+const MIGRATIONS: &[(i32, &str)] = &[
+    (1, include_str!("../migrations/0001_init.sql")),
+    (2, include_str!("../migrations/0002_worker_lease.sql")),
+];
 
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)
@@ -24,6 +28,10 @@ fn configure(conn: &Connection) -> Result<()> {
     // WAL so a reader listing the queue never blocks the worker mid-merge.
     conn.pragma_update(None, "journal_mode", "wal")?;
     conn.pragma_update(None, "foreign_keys", true)?;
+    // Workers race to acquire the lease. Without a busy timeout the loser gets
+    // SQLITE_BUSY rather than waiting its turn for the write lock, which would
+    // turn an ordinary race into an error.
+    conn.busy_timeout(Duration::from_secs(5))?;
     Ok(())
 }
 
