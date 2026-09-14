@@ -1,0 +1,32 @@
+# Single crate for now. The workspace table is present so splitting reusable
+# pieces into crates/ later does not require restructuring the manifest.
+[workspace]
+resolver = "3"
+members = []
+
+[package]
+name = "sasse"
+version = "0.1.0"
+edition = "2024"
+description = "A local merge queue: batch, gate, fast-forward"
+authors = ["Thomas Roche"]
+repository = "https://github.com/thoroc/sasse"
+readme = "README.md"
+license = "MIT"
+categories = ["command-line-utilities", "development-tools"]
+rust-version = "1.95"
+
+[[bin]]
+name = "sasse"
+path = "src/main.rs"
+
+[profile.serious]
+inherits = "release"
+lto = true
+panic = "abort"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+color-eyre = { version = "0.6", default-features = false }
+eyre = "0.6"
+rusqlite = { version = "0.37", features = ["bundled"] }

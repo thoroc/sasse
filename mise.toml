@@ -1,0 +1,22 @@
+# Put the debug build ahead of any installed sasse so `sasse` in this repo is
+# always the one just compiled.
+[env]
+_.path = ["./target/debug"]
+
+[tools]
+# The toolchain is pinned in rust-toolchain.toml and left to rustup, so mise
+# does not install a second copy of a compiler that is already present.
+"aqua:nextest-rs/nextest/cargo-nextest" = "latest"
+taplo = "latest"
+
+[tasks.build]
+run = "cargo build"
+
+[tasks.test]
+run = "cargo nextest run"
+
+[tasks.lint]
+run = ["cargo clippy --all-targets -- -D warnings", "cargo fmt --check", "taplo fmt --check"]
+
+[tasks.fmt]
+run = ["cargo fmt", "taplo fmt"]
