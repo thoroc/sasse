@@ -1,4 +1,7 @@
 use std::cell::Cell;
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -8,7 +11,7 @@ use eyre::Result;
 
 use sasse::config::{self, Config};
 use sasse::git::{CommandGit, Git, Sha};
-use sasse::queue::store::{Snapshot, StatusEntry};
+use sasse::queue::store::{Amendment, Run, Snapshot, StatusEntry};
 use sasse::queue::{lease, store};
 use sasse::worker::{Progress, TickOutcome, WorkOptions, Worker, work};
 use sasse::{db, gate, shutdown};
@@ -91,6 +94,37 @@ enum Command {
         /// Stop after this many ticks fail in a row.
         #[arg(long, default_value = "5")]
         give_up_after: usize,
+    },
+
+    /// Take a waiting entry out of the queue.
+    Dequeue {
+        /// Entry number, as shown by `sasse status`.
+        entry: i64,
+
+        #[command(flatten)]
+        target: Target,
+    },
+
+    /// Move a waiting entry to the front of the queue.
+    Promote {
+        /// Entry number, as shown by `sasse status`.
+        entry: i64,
+
+        #[command(flatten)]
+        target: Target,
+    },
+
+    /// Show gate output.
+    Logs {
+        /// Candidate to show. Omit to list recent gate runs.
+        candidate: Option<i64>,
+
+        #[command(flatten)]
+        target: Target,
+
+        /// Lines of the log to show.
+        #[arg(long, default_value = "40")]
+        tail: usize,
     },
 
     /// Show the queue.
@@ -204,6 +238,69 @@ fn main() -> Result<()> {
                 "stopped after {} tick(s): {} landed, {} evicted, {} failed tick(s)",
                 summary.ticks, summary.entries_landed, summary.entries_evicted, summary.failures
             );
+        }
+
+        Command::Dequeue { entry, target } => {
+            let conn = db::open(&cli.db)?;
+            let repo = canonical(&target.repo)?;
+
+            match store::dequeue(&conn, &repo, &target.base, entry)? {
+                Amendment::Applied => println!("entry {entry} taken out of the queue"),
+                Amendment::NotWaiting(state) => println!(
+                    "entry {entry} is {}, not waiting, so it was left alone",
+                    state.as_str()
+                ),
+                Amendment::Unknown => {
+                    println!("no entry {entry} queued against {}", target.base)
+                }
+            }
+        }
+
+        Command::Promote { entry, target } => {
+            let conn = db::open(&cli.db)?;
+            let repo = canonical(&target.repo)?;
+
+            match store::promote(&conn, &repo, &target.base, entry)? {
+                Amendment::Applied => println!("entry {entry} moved to the front of the queue"),
+                Amendment::NotWaiting(state) => println!(
+                    "entry {entry} is {}, not waiting, so it was left alone",
+                    state.as_str()
+                ),
+                Amendment::Unknown => {
+                    println!("no entry {entry} queued against {}", target.base)
+                }
+            }
+        }
+
+        Command::Logs {
+            candidate,
+            target,
+            tail,
+        } => {
+            let conn = db::open(&cli.db)?;
+            let repo = canonical(&target.repo)?;
+
+            match candidate {
+                None => {
+                    let recent = store::recent_runs(&conn, &repo, &target.base, 10)?;
+                    if recent.is_empty() {
+                        println!("no gate has run against {} yet", target.base);
+                    } else {
+                        print_runs(&recent);
+                        println!();
+                        println!("sasse logs <candidate> to read one");
+                    }
+                }
+                Some(candidate) => {
+                    let runs = store::runs(&conn, candidate)?;
+                    if runs.is_empty() {
+                        println!("candidate {candidate} has no gate runs");
+                    } else {
+                        print_runs(&runs);
+                        print_tail(runs.last().expect("checked not empty"), tail);
+                    }
+                }
+            }
         }
 
         Command::Status { target, settled } => {
@@ -349,6 +446,9 @@ fn print_entries(heading: &str, entries: &[StatusEntry], budget: Option<u32>) {
     println!("{heading} ({})", entries.len());
     for entry in entries {
         let mut notes = Vec::new();
+        if entry.priority > 0 {
+            notes.push("promoted".to_string());
+        }
         if entry.attempts > 0 {
             notes.push(match budget {
                 Some(budget) => format!("attempt {} of {budget}", entry.attempts),
@@ -373,6 +473,57 @@ fn print_entries(heading: &str, entries: &[StatusEntry], budget: Option<u32>) {
             suffix
         );
     }
+}
+
+fn print_runs(runs: &[Run]) {
+    for run in runs {
+        let verdict = match run.exit_code {
+            Some(0) => "passed".to_string(),
+            Some(code) => format!("failed ({code})"),
+            None => "killed".to_string(),
+        };
+        println!(
+            "run {:<4} candidate {:<4} {:<12} {}  {}",
+            run.id, run.candidate_id, verdict, run.started_at, run.command
+        );
+    }
+}
+
+fn print_tail(run: &Run, lines: usize) {
+    let Some(path) = &run.log_path else {
+        println!();
+        println!("run {} recorded no log", run.id);
+        return;
+    };
+
+    println!();
+    println!("{path}");
+
+    match tail_of(std::path::Path::new(path), lines) {
+        Err(unreadable) => println!("  (could not be read: {unreadable})"),
+        Ok(tail) if tail.is_empty() => println!("  (empty)"),
+        Ok(tail) => {
+            for line in tail {
+                println!("  {line}");
+            }
+        }
+    }
+}
+
+/// The last `lines` lines, without holding the whole file: a verbose gate can
+/// leave a log far larger than the part anyone wants to read.
+fn tail_of(path: &std::path::Path, lines: usize) -> Result<Vec<String>> {
+    let file = File::open(path)?;
+    let mut kept: VecDeque<String> = VecDeque::with_capacity(lines.saturating_add(1));
+
+    for line in BufReader::new(file).lines() {
+        kept.push_back(line?);
+        if kept.len() > lines {
+            kept.pop_front();
+        }
+    }
+
+    Ok(kept.into())
 }
 
 fn short(sha: &Sha) -> String {

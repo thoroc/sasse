@@ -45,6 +45,9 @@ sasse enqueue feat/my-branch --repo . --base main --db queue.db
 sasse status --repo . --base main --db queue.db
 sasse tick --repo . --base main --integration ../integration --db queue.db
 sasse work --repo . --base main --integration ../integration --db queue.db
+sasse promote 7 --repo . --base main --db queue.db
+sasse dequeue 7 --repo . --base main --db queue.db
+sasse logs 12 --repo . --base main --db queue.db
 ```
 
 A tick takes the lease, advances the queue by at most one candidate, and gives
@@ -62,6 +65,17 @@ are requeued, and nobody's retry budget is charged.
 `status` reads the queue and changes nothing. It shows the base tip, who holds
 the lease and for how long, the candidate in flight, what is waiting, and what
 recently merged or was evicted and why.
+
+`promote` moves a waiting entry to the front, and `dequeue` takes one out.
+Neither will touch an entry that is inside a candidate: it is mid-gate, and
+pulling it out from under the worker would leave a candidate referring to
+something no longer in the queue. A hand removal is recorded as an eviction
+reading `removed by hand`, so a decision stays distinguishable from a verdict.
+
+`logs` with no argument lists recent gate runs with their verdicts; with a
+candidate it prints that candidate's runs and the tail of the last one. Gate
+logs outlive the queue rows that point at them, so an old one is still readable
+after the queue has moved on.
 
 ## Configuration
 
@@ -151,8 +165,8 @@ Early. What exists:
 - `src/shutdown.rs`, turning a signal into a request to stop between ticks.
 - `src/db.rs`, the migration runner.
 
-Not yet written: any way to dequeue or reprioritise an entry by hand, and
-anything that reads the gate logs back out.
+Not yet written: anything that prunes old gate logs, and any handling of a
+repository with more than one base branch beyond keeping their queues separate.
 
 ## Development
 

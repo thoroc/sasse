@@ -113,6 +113,7 @@ pub struct StatusEntry {
     pub branch_sha: Sha,
     pub state: EntryState,
     pub attempts: u32,
+    pub priority: i64,
     pub evict_reason: Option<String>,
 }
 
@@ -176,7 +177,7 @@ fn status_entries(
     // from outside; the parameters that vary are bound.
     let limit = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
     let sql = format!(
-        "SELECT id, branch, branch_sha, state, attempts, evict_reason
+        "SELECT id, branch, branch_sha, state, attempts, priority, evict_reason
          FROM entry
          WHERE repo_path = ?1 AND base_branch = ?2 AND {predicate}
          ORDER BY {order}{limit}"
@@ -190,23 +191,171 @@ fn status_entries(
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
             row.get::<_, u32>(4)?,
-            row.get::<_, Option<String>>(5)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, Option<String>>(6)?,
         ))
     })?;
 
     rows.collect::<rusqlite::Result<Vec<_>>>()?
         .into_iter()
-        .map(|(id, branch, sha, state, attempts, evict_reason)| {
-            Ok(StatusEntry {
-                id,
-                branch,
-                branch_sha: Sha::parse(&sha)?,
-                state: EntryState::parse(&state)?,
-                attempts,
-                evict_reason,
-            })
-        })
+        .map(
+            |(id, branch, sha, state, attempts, priority, evict_reason)| {
+                Ok(StatusEntry {
+                    id,
+                    branch,
+                    branch_sha: Sha::parse(&sha)?,
+                    state: EntryState::parse(&state)?,
+                    attempts,
+                    priority,
+                    evict_reason,
+                })
+            },
+        )
         .collect()
+}
+
+/// Why an entry left the queue by hand rather than by verdict.
+pub const REMOVED_BY_HAND: &str = "removed by hand";
+
+/// The result of changing one entry by hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Amendment {
+    Applied,
+    /// It is not waiting, so there is nothing to change. An entry inside a
+    /// candidate is mid-gate, and pulling it out from under the worker would
+    /// leave a candidate referring to something no longer in the queue.
+    NotWaiting(EntryState),
+    Unknown,
+}
+
+/// Take a waiting entry out of the queue.
+///
+/// Recorded as an eviction with a reason saying it was deliberate, rather than
+/// as a new state: it is out of the queue and it did not merge, which is what
+/// evicted already means. The reason is what distinguishes a decision from a
+/// verdict.
+pub fn dequeue(
+    conn: &Connection,
+    repo_path: &str,
+    base_branch: &str,
+    entry: EntryId,
+) -> Result<Amendment> {
+    let Some(state) = entry_state(conn, repo_path, base_branch, entry)? else {
+        return Ok(Amendment::Unknown);
+    };
+    if state != EntryState::Queued {
+        return Ok(Amendment::NotWaiting(state));
+    }
+
+    conn.execute(
+        "UPDATE entry SET state = 'evicted', evict_reason = ?2, updated_at = ?3
+         WHERE id = ?1",
+        (entry, REMOVED_BY_HAND, now_stamp()),
+    )?;
+    Ok(Amendment::Applied)
+}
+
+/// Move a waiting entry to the front.
+///
+/// Selection orders by priority descending then by id, so one above every other
+/// waiting entry is enough. Promoting a second entry puts it ahead of the
+/// first, which keeps promotions themselves in the order they were asked for.
+pub fn promote(
+    conn: &Connection,
+    repo_path: &str,
+    base_branch: &str,
+    entry: EntryId,
+) -> Result<Amendment> {
+    let Some(state) = entry_state(conn, repo_path, base_branch, entry)? else {
+        return Ok(Amendment::Unknown);
+    };
+    if state != EntryState::Queued {
+        return Ok(Amendment::NotWaiting(state));
+    }
+
+    conn.execute(
+        "UPDATE entry
+         SET priority = (
+                 SELECT COALESCE(MAX(priority), 0) + 1
+                 FROM entry
+                 WHERE repo_path = ?2 AND base_branch = ?3 AND state = 'queued'
+             ),
+             updated_at = ?4
+         WHERE id = ?1",
+        (entry, repo_path, base_branch, now_stamp()),
+    )?;
+    Ok(Amendment::Applied)
+}
+
+fn entry_state(
+    conn: &Connection,
+    repo_path: &str,
+    base_branch: &str,
+    entry: EntryId,
+) -> Result<Option<EntryState>> {
+    let found: Option<String> = conn
+        .query_row(
+            "SELECT state FROM entry
+             WHERE id = ?1 AND repo_path = ?2 AND base_branch = ?3",
+            (entry, repo_path, base_branch),
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    found.map(|state| EntryState::parse(&state)).transpose()
+}
+
+/// One execution of the gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Run {
+    pub id: i64,
+    pub candidate_id: i64,
+    pub command: String,
+    pub exit_code: Option<i32>,
+    /// The log outlives this row, so it may point at a file that is still there
+    /// long after the queue has forgotten why it mattered.
+    pub log_path: Option<String>,
+    pub started_at: String,
+}
+
+/// Gate runs for one candidate, oldest first.
+pub fn runs(conn: &Connection, candidate_id: i64) -> Result<Vec<Run>> {
+    let mut statement = conn.prepare(
+        "SELECT id, candidate_id, command, exit_code, log_path, started_at
+         FROM run WHERE candidate_id = ?1 ORDER BY id ASC",
+    )?;
+    let rows = statement.query_map([candidate_id], row_to_run)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// The most recent gate runs against this base branch, newest first.
+pub fn recent_runs(
+    conn: &Connection,
+    repo_path: &str,
+    base_branch: &str,
+    limit: usize,
+) -> Result<Vec<Run>> {
+    let mut statement = conn.prepare(
+        "SELECT r.id, r.candidate_id, r.command, r.exit_code, r.log_path, r.started_at
+         FROM run r
+         JOIN candidate c ON c.id = r.candidate_id
+         WHERE c.repo_path = ?1 AND c.base_branch = ?2
+         ORDER BY r.id DESC
+         LIMIT ?3",
+    )?;
+    let rows = statement.query_map((repo_path, base_branch, limit as i64), row_to_run)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
+    Ok(Run {
+        id: row.get(0)?,
+        candidate_id: row.get(1)?,
+        command: row.get(2)?,
+        exit_code: row.get(3)?,
+        log_path: row.get(4)?,
+        started_at: row.get(5)?,
+    })
 }
 
 #[cfg(test)]
@@ -291,6 +440,167 @@ mod tests {
     fn an_empty_queue_yields_an_empty_batch() {
         let conn = db::open_in_memory().unwrap();
         assert!(select_batch(&conn, REPO, BASE, 8).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_waiting_entry_can_be_taken_out_by_hand() {
+        let conn = db::open_in_memory().unwrap();
+        let id = queue(&conn, "feat/unwanted", 1, 0);
+
+        assert_eq!(dequeue(&conn, REPO, BASE, id).unwrap(), Amendment::Applied);
+
+        let snap = snapshot(&conn, REPO, BASE, 10).unwrap();
+        assert!(snap.queued.is_empty());
+        assert_eq!(snap.settled.len(), 1);
+        assert_eq!(snap.settled[0].state, EntryState::Evicted);
+        assert_eq!(
+            snap.settled[0].evict_reason.as_deref(),
+            Some(REMOVED_BY_HAND),
+            "a deliberate removal must be distinguishable from a verdict"
+        );
+    }
+
+    /// Pulling an entry out from under the worker would leave a candidate
+    /// referring to something no longer in the queue.
+    #[test]
+    fn an_entry_inside_a_candidate_cannot_be_taken_out() {
+        let mut conn = db::open_in_memory().unwrap();
+        let id = queue(&conn, "feat/in-flight", 1, 0);
+        let entry = Entry {
+            id,
+            branch: "feat/in-flight".into(),
+            branch_sha: sha(1),
+            attempts: 0,
+        };
+        open_candidate(
+            &mut conn,
+            REPO,
+            BASE,
+            &sha(200),
+            std::slice::from_ref(&entry),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            dequeue(&conn, REPO, BASE, id).unwrap(),
+            Amendment::NotWaiting(EntryState::Batched)
+        );
+    }
+
+    #[test]
+    fn dequeueing_something_that_is_not_there_says_so() {
+        let conn = db::open_in_memory().unwrap();
+        assert_eq!(dequeue(&conn, REPO, BASE, 404).unwrap(), Amendment::Unknown);
+    }
+
+    #[test]
+    fn an_entry_from_another_base_branch_is_not_reachable() {
+        let conn = db::open_in_memory().unwrap();
+        let elsewhere = enqueue(&conn, REPO, "release", "feat/other", &sha(9)).unwrap();
+        assert_eq!(
+            dequeue(&conn, REPO, BASE, elsewhere).unwrap(),
+            Amendment::Unknown
+        );
+    }
+
+    #[test]
+    fn a_promoted_entry_is_selected_first() {
+        let conn = db::open_in_memory().unwrap();
+        queue(&conn, "feat/first", 1, 0);
+        queue(&conn, "feat/second", 2, 0);
+        let urgent = queue(&conn, "feat/urgent", 3, 0);
+
+        assert_eq!(
+            promote(&conn, REPO, BASE, urgent).unwrap(),
+            Amendment::Applied
+        );
+
+        let batch = select_batch(&conn, REPO, BASE, 8).unwrap();
+        assert_eq!(
+            branches(&batch),
+            vec!["feat/urgent", "feat/first", "feat/second"]
+        );
+    }
+
+    /// Promotions stay in the order they were asked for.
+    #[test]
+    fn a_later_promotion_goes_ahead_of_an_earlier_one() {
+        let conn = db::open_in_memory().unwrap();
+        let first = queue(&conn, "feat/a", 1, 0);
+        let second = queue(&conn, "feat/b", 2, 0);
+        queue(&conn, "feat/c", 3, 0);
+
+        promote(&conn, REPO, BASE, first).unwrap();
+        promote(&conn, REPO, BASE, second).unwrap();
+
+        let batch = select_batch(&conn, REPO, BASE, 8).unwrap();
+        assert_eq!(branches(&batch), vec!["feat/b", "feat/a", "feat/c"]);
+    }
+
+    #[test]
+    fn a_settled_entry_cannot_be_promoted() {
+        let conn = db::open_in_memory().unwrap();
+        let id = queue(&conn, "feat/done", 1, 0);
+        conn.execute("UPDATE entry SET state = 'merged' WHERE id = ?1", [id])
+            .unwrap();
+
+        assert_eq!(
+            promote(&conn, REPO, BASE, id).unwrap(),
+            Amendment::NotWaiting(EntryState::Merged)
+        );
+    }
+
+    #[test]
+    fn promotion_shows_up_in_the_status_listing() {
+        let conn = db::open_in_memory().unwrap();
+        let id = queue(&conn, "feat/urgent", 1, 0);
+        promote(&conn, REPO, BASE, id).unwrap();
+
+        let snap = snapshot(&conn, REPO, BASE, 10).unwrap();
+        assert!(
+            snap.queued[0].priority > 0,
+            "a promotion the operator cannot see is not much use"
+        );
+    }
+
+    #[test]
+    fn gate_runs_are_readable_for_a_candidate_and_across_the_branch() {
+        let mut conn = db::open_in_memory().unwrap();
+        let id = queue(&conn, "feat/a", 1, 0);
+        let entry = Entry {
+            id,
+            branch: "feat/a".into(),
+            branch_sha: sha(1),
+            attempts: 0,
+        };
+        let candidate = open_candidate(
+            &mut conn,
+            REPO,
+            BASE,
+            &sha(200),
+            std::slice::from_ref(&entry),
+            None,
+        )
+        .unwrap();
+
+        record_run(&conn, candidate, "gate one", Some(0), "/logs/one.log").unwrap();
+        record_run(&conn, candidate, "gate two", Some(1), "/logs/two.log").unwrap();
+
+        let for_candidate = runs(&conn, candidate).unwrap();
+        assert_eq!(for_candidate.len(), 2);
+        assert_eq!(for_candidate[0].command, "gate one", "oldest first");
+        assert_eq!(for_candidate[1].exit_code, Some(1));
+
+        let recent = recent_runs(&conn, REPO, BASE, 10).unwrap();
+        assert_eq!(recent[0].command, "gate two", "newest first");
+        assert_eq!(recent[0].log_path.as_deref(), Some("/logs/two.log"));
+    }
+
+    #[test]
+    fn runs_from_another_base_branch_are_not_listed() {
+        let conn = db::open_in_memory().unwrap();
+        assert!(recent_runs(&conn, REPO, "release", 10).unwrap().is_empty());
     }
 
     #[test]

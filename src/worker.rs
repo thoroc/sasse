@@ -170,6 +170,15 @@ pub fn work(
                 }
             }
             Err(failed) => {
+                // A signal reaches every child process, so git or the gate can
+                // die mid-command and report a non-zero exit with nothing on
+                // stderr. That is the interruption arriving, not a fault, and
+                // counting it would end a clean shutdown with a phantom
+                // failure and a misleading error.
+                if stop() {
+                    break;
+                }
+
                 consecutive_failures += 1;
                 summary.failures += 1;
 
@@ -1404,6 +1413,50 @@ mod loop_tests {
             reported.contains("3 consecutive failed ticks"),
             "the error should say why it stopped: {reported}"
         );
+    }
+
+    /// A signal kills the child processes too, so the command a tick was in the
+    /// middle of fails. On the way out that is the interruption, not a fault.
+    #[test]
+    fn a_failure_caused_by_the_shutdown_itself_is_not_counted() {
+        struct DiesOnTheSignal<'a> {
+            stopping: &'a Cell<bool>,
+        }
+        impl Gate for DiesOnTheSignal<'_> {
+            fn run(&self, _: &str, _: &Sha, _: &Path) -> Result<gate::Verdict> {
+                // The signal arrives while the gate is running, killing it.
+                self.stopping.set(true);
+                Err(eyre!("killed"))
+            }
+        }
+
+        let mut conn = db::open_in_memory().unwrap();
+        let git = repo_with_gate(CONFIG);
+        let stopping = Cell::new(false);
+        let gate = DiesOnTheSignal {
+            stopping: &stopping,
+        };
+        let dir = logs();
+        queue_branch(&conn, "feat/a", &FakeGit::commit(2));
+
+        let summary = work(
+            &mut conn,
+            &git,
+            &gate,
+            REPO,
+            base_branch(),
+            dir.path(),
+            immediate(),
+            &|| stopping.get(),
+            &ignore,
+        )
+        .unwrap();
+
+        assert_eq!(
+            summary.failures, 0,
+            "a clean shutdown must not end with a phantom failure"
+        );
+        assert_eq!(summary.ticks, 0);
     }
 
     /// The budget counts failures in a row, not failures in total. A transient
