@@ -44,3 +44,16 @@
       from = "proposed"
       to = "accepted"
       at = 2026-09-15T08:29:57.408951Z
+  [decisions.on-settle-hook]
+    file = "on-settle-hook.md"
+    type = "feat"
+    status = "accepted"
+    created = "2026-09-15"
+    author = "thoroc"
+    tags = []
+    description = "A command run when an entry merges or is evicted, reported but never fatal, with a timeout"
+
+    [[decisions.on-settle-hook.history]]
+      from = "proposed"
+      to = "accepted"
+      at = 2026-09-15T12:46:07.060614Z
