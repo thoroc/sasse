@@ -253,9 +253,9 @@ Tool versions are pinned in `mise.toml` and locked in `mise.lock`, and CI
 installs them through mise rather than using whatever the runner image ships, so
 a linter cannot pass locally and fail in CI over a version difference.
 
-`.github/workflows/ci.yml` runs `mise run check` and `mise run test`, asserts
-the tool lockfile is current, and drives the built binary against a throwaway
-repository, because the unit tests use fakes for git and for the gate and
+`.github/workflows/ci.yml` runs `mise run check` and `mise run test`, checks that
+no tool version changed without `mise.lock` being committed, and drives the built
+binary against a throwaway repository, because the unit tests use fakes for git and for the gate and
 several real bugs here were only reachable without them. Every action is pinned
 to a full commit SHA, and `zizmor.yml` lints the workflows themselves. Note that
 this repository has no remote, so those workflows do not run anywhere yet; `mise

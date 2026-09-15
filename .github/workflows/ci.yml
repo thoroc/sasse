@@ -56,13 +56,31 @@ jobs:
         run: ./scripts/check-migrations-append-only.sh "$BASE"
 
       # A lockfile that was not committed makes every later run resolve
-      # different tool versions than the one that passed.
-      - name: The tool lockfile is current
+      # different tool versions than the one that passed, which is the thing
+      # worth catching.
+      #
+      # It cannot be caught by asserting the file is unchanged. mise.lock holds
+      # a checksum per tool per platform, and each is filled in lazily the first
+      # time that platform downloads the artifact. A repository developed on
+      # macOS and built on Linux therefore always produces a diff on its first
+      # Linux run, for every tool, and that diff is correct rather than stale.
+      #
+      # So the check rejects anything that is not a checksum being backfilled:
+      # a changed version, a removed entry, a new tool nobody committed.
+      - name: No uncommitted tool version changes
         run: |
           mise install
-          if ! git diff --exit-code -- mise.lock; then
-            echo "::error::mise.lock is out of date. Run 'mise install' and commit it."
+          changed=$(git diff --unified=0 -- mise.lock | grep -E '^[+-]' \
+            | grep -vE '^(\+\+\+|---)' | grep -vE '^\+checksum = "' || true)
+
+          if [ -n "$changed" ]; then
+            echo "::error::mise.lock disagrees with mise.toml. Run 'mise install' and commit it."
+            printf '%s\n' "$changed"
             exit 1
+          fi
+
+          if ! git diff --quiet -- mise.lock; then
+            echo "mise backfilled platform checksums for this runner; no version changed."
           fi
 
   test:
