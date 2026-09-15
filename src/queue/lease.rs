@@ -155,6 +155,44 @@ pub fn acquire(
     })
 }
 
+/// A lease as it stands, for reporting rather than for taking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Held {
+    pub holder_pid: i32,
+    pub acquired_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    /// Past its expiry, so anyone may take it.
+    pub expired: bool,
+    /// Whether the recorded holder still exists. A confirmed absence allows an
+    /// early reclaim; anything else is reported as present.
+    pub holder_present: bool,
+}
+
+/// Who holds the branch, if anyone. Takes nothing and changes nothing.
+pub fn current(conn: &Connection, repo_path: &str, base_branch: &str) -> Result<Option<Held>> {
+    let found: Option<(i32, String, String)> = conn
+        .query_row(
+            "SELECT holder_pid, acquired_at, expires_at FROM worker_lease
+             WHERE repo_path = ?1 AND base_branch = ?2",
+            (repo_path, base_branch),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+
+    let Some((holder_pid, acquired_at, expires_at)) = found else {
+        return Ok(None);
+    };
+
+    let expires_at = parse_stamp(&expires_at)?;
+    Ok(Some(Held {
+        holder_pid,
+        acquired_at: parse_stamp(&acquired_at)?,
+        expires_at,
+        expired: expires_at <= Utc::now(),
+        holder_present: liveness(holder_pid) == Liveness::Present,
+    }))
+}
+
 /// Push the expiry out. Fails if the lease is no longer ours.
 ///
 /// A worker must treat that failure as fatal to its current work: another
@@ -474,6 +512,50 @@ mod tests {
         let (_, reclaimed) = acquired(acquire(&mut conn, "/repo", "main", TTL).unwrap());
         assert_eq!(reclaimed.unwrap().candidates_superseded, 0);
         assert_eq!(state_of(&conn, "candidate", candidate_id), "passed");
+    }
+
+    #[test]
+    fn an_unheld_branch_reports_no_lease() {
+        let (_dir, path) = queue();
+        let conn = db::open(&path).unwrap();
+        assert_eq!(current(&conn, "/repo", "main").unwrap(), None);
+    }
+
+    #[test]
+    fn a_held_branch_reports_its_holder() {
+        let (_dir, path) = queue();
+        let mut conn = db::open(&path).unwrap();
+        let (lease, _) = acquired(acquire(&mut conn, "/repo", "main", TTL).unwrap());
+
+        let held = current(&conn, "/repo", "main").unwrap().unwrap();
+        assert_eq!(held.holder_pid, lease.holder_pid);
+        assert!(!held.expired);
+        assert!(held.holder_present, "we are the holder and we are running");
+    }
+
+    #[test]
+    fn a_dead_holder_is_reported_as_absent() {
+        let (_dir, path) = queue();
+        let conn = db::open(&path).unwrap();
+        write_lease(&conn, reaped_pid(), Utc::now() + chrono::Duration::hours(1));
+
+        let held = current(&conn, "/repo", "main").unwrap().unwrap();
+        assert!(!held.holder_present);
+        assert!(!held.expired, "not expired, merely abandoned");
+    }
+
+    #[test]
+    fn an_expired_lease_is_reported_as_expired() {
+        let (_dir, path) = queue();
+        let conn = db::open(&path).unwrap();
+        write_lease(
+            &conn,
+            std::process::id() as i32,
+            Utc::now() - chrono::Duration::seconds(1),
+        );
+
+        let held = current(&conn, "/repo", "main").unwrap().unwrap();
+        assert!(held.expired);
     }
 
     #[test]

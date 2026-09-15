@@ -7,7 +7,7 @@
 //! behaviour testable and what lets a crashed worker be resumed by the next
 //! tick rather than needing recovery logic of its own.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use eyre::{Result, WrapErr, eyre};
@@ -25,6 +25,13 @@ use crate::queue::{Acquisition, CandidateState, EntryId, bisect, lease};
 pub enum Abandoned {
     /// The base branch moved, so what the gate proved no longer applies.
     BaseMoved,
+    /// The worker was asked to stop while the gate was running.
+    ///
+    /// A signal reaches the whole process group, so the gate's shell dies with
+    /// the worker and exits non-zero. That is not the branch misbehaving, and
+    /// charging it an attempt would let repeated interruptions evict something
+    /// that never failed on its merits.
+    Interrupted,
 }
 
 /// Why a candidate was pinned on one entry.
@@ -75,6 +82,141 @@ pub enum TickOutcome {
     },
 }
 
+/// How the loop around `tick` is paced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkOptions {
+    /// How long to wait when there is nothing to do, or when the queue needs a
+    /// human before it can progress.
+    pub idle: Duration,
+    /// Stop after this many ticks fail in a row.
+    ///
+    /// Some failures never clear on their own: a missing gate config, or a
+    /// repository that has moved. Looping on those forever would be a worker
+    /// that looks alive and achieves nothing, so it gives up and says why.
+    pub give_up_after: usize,
+}
+
+impl Default for WorkOptions {
+    fn default() -> Self {
+        Self {
+            idle: Duration::from_secs(2),
+            give_up_after: 5,
+        }
+    }
+}
+
+/// What the loop saw, reported as it happens rather than at the end.
+pub enum Progress<'a> {
+    Ticked(&'a TickOutcome),
+    Failed(&'a eyre::Report),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkSummary {
+    pub ticks: usize,
+    pub entries_landed: usize,
+    pub entries_evicted: usize,
+    pub failures: usize,
+}
+
+/// How long to wait before ticking again.
+///
+/// Progress means there is probably more to do straight away; anything else
+/// means waiting is the right move. Separated out from the loop so the pacing
+/// can be tested without sleeping.
+pub fn pause_after(outcome: &TickOutcome, idle: Duration) -> Duration {
+    if outcome.is_progress() {
+        Duration::ZERO
+    } else {
+        idle
+    }
+}
+
+/// Tick until asked to stop.
+///
+/// `stop` is checked between ticks rather than during one, so a worker always
+/// finishes the candidate it is on. It is a closure rather than a signal check
+/// so the loop can be tested without installing handlers.
+#[allow(clippy::too_many_arguments)]
+pub fn work(
+    conn: &mut Connection,
+    git: &dyn Git,
+    gate: &dyn Gate,
+    repo_path: &str,
+    base_branch: &str,
+    log_dir: &Path,
+    options: WorkOptions,
+    stop: &dyn Fn() -> bool,
+    observe: &dyn Fn(Progress<'_>),
+) -> Result<WorkSummary> {
+    let mut summary = WorkSummary::default();
+    let mut consecutive_failures = 0usize;
+
+    while !stop() {
+        let ticked = Worker::new(conn, git, gate, repo_path, base_branch, log_dir)
+            .with_interrupt(stop)
+            .tick();
+
+        match ticked {
+            Ok(outcome) => {
+                consecutive_failures = 0;
+                summary.ticks += 1;
+                summary.record(&outcome);
+                observe(Progress::Ticked(&outcome));
+
+                let pause = pause_after(&outcome, options.idle);
+                if !pause.is_zero() && !stop() {
+                    std::thread::sleep(pause);
+                }
+            }
+            Err(failed) => {
+                consecutive_failures += 1;
+                summary.failures += 1;
+
+                if consecutive_failures >= options.give_up_after {
+                    return Err(failed.wrap_err(format!(
+                        "giving up after {consecutive_failures} consecutive failed ticks"
+                    )));
+                }
+
+                observe(Progress::Failed(&failed));
+                if !stop() {
+                    std::thread::sleep(options.idle);
+                }
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
+impl WorkSummary {
+    fn record(&mut self, outcome: &TickOutcome) {
+        match outcome {
+            TickOutcome::Landed { entries, .. } => self.entries_landed += entries,
+            TickOutcome::Blamed {
+                blame: Blame::Evicted,
+                ..
+            } => self.entries_evicted += 1,
+            _ => {}
+        }
+    }
+}
+
+impl TickOutcome {
+    /// Whether the queue moved.
+    ///
+    /// Drives both how soon to tick again and whether the outcome is worth
+    /// reporting twice in a row: a resident worker repeating "nothing queued"
+    /// every interval is noise that buries the lines that matter.
+    pub fn is_progress(&self) -> bool {
+        matches!(
+            self,
+            Self::Landed { .. } | Self::Split { .. } | Self::Blamed { .. } | Self::Abandoned { .. }
+        )
+    }
+}
+
 pub struct Worker<'a> {
     conn: &'a mut Connection,
     git: &'a dyn Git,
@@ -83,6 +225,9 @@ pub struct Worker<'a> {
     base_branch: String,
     log_dir: PathBuf,
     lease_ttl: Duration,
+    /// Whether a stop has been asked for. Injected rather than read from
+    /// process state, so a tick stays a function of its inputs.
+    interrupted: &'a dyn Fn() -> bool,
 }
 
 impl<'a> Worker<'a> {
@@ -102,11 +247,18 @@ impl<'a> Worker<'a> {
             base_branch: base_branch.into(),
             log_dir: log_dir.into(),
             lease_ttl: Duration::from_secs(300),
+            interrupted: &|| false,
         }
     }
 
     pub fn with_lease_ttl(mut self, ttl: Duration) -> Self {
         self.lease_ttl = ttl;
+        self
+    }
+
+    /// Tell the tick how to find out that a stop was asked for.
+    pub fn with_interrupt(mut self, interrupted: &'a dyn Fn() -> bool) -> Self {
+        self.interrupted = interrupted;
         self
     }
 
@@ -166,10 +318,18 @@ impl<'a> Worker<'a> {
         let verdict = self.gate_candidate(&candidate, &candidate_sha, &config)?;
 
         if verdict.passed() {
-            self.land(&candidate, &candidate_sha)
-        } else {
-            self.on_gate_failure(&candidate, &config)
+            return self.land(&candidate, &candidate_sha);
         }
+
+        // A gate that died because the worker was signalled says nothing about
+        // the branches in the candidate. If a stop is pending we treat the
+        // failure as no verdict at all, which errs towards never evicting
+        // something that did not actually fail.
+        if (self.interrupted)() {
+            return self.abandon(candidate.id, Abandoned::Interrupted);
+        }
+
+        self.on_gate_failure(&candidate, &config)
     }
 
     /// The gate command, read out of the base commit rather than off disk. See
@@ -390,9 +550,13 @@ mod tests {
     use crate::queue::store::Entry;
     use crate::{db, queue};
 
-    const REPO: &str = "/repo";
+    pub(super) const REPO: &str = "/repo";
     const BASE: &str = "main";
-    const CONFIG: &str = "gate = \"run-the-gate\"\n";
+    pub(super) const CONFIG: &str = "gate = \"run-the-gate\"\n";
+
+    pub(super) fn base_branch() -> &'static str {
+        BASE
+    }
 
     fn base() -> Sha {
         FakeGit::commit(1)
@@ -401,17 +565,21 @@ mod tests {
     /// A repository whose base branch is checked out nowhere and which has a
     /// gate configured in every commit.
     fn repo() -> FakeGit {
+        repo_with_gate(CONFIG)
+    }
+
+    pub(super) fn repo_with_gate(config: &str) -> FakeGit {
         FakeGit::new()
             .with_branch("refs/heads/main", &base())
-            .with_file_everywhere(config::CONFIG_PATH, CONFIG)
+            .with_file_everywhere(config::CONFIG_PATH, config)
             .with_checkout("/integration", None)
     }
 
-    fn logs() -> TempDir {
+    pub(super) fn logs() -> TempDir {
         tempfile::tempdir().unwrap()
     }
 
-    fn queue_branch(conn: &Connection, name: &str, at: &Sha) -> EntryId {
+    pub(super) fn queue_branch(conn: &Connection, name: &str, at: &Sha) -> EntryId {
         store::enqueue(conn, REPO, BASE, name, at).unwrap()
     }
 
@@ -836,6 +1004,60 @@ mod tests {
         );
     }
 
+    /// A signal reaches the gate's shell too, so its non-zero exit is the
+    /// interruption rather than a verdict on the branch.
+    #[test]
+    fn a_gate_killed_by_a_shutdown_is_not_the_branchs_fault() {
+        let mut conn = db::open_in_memory().unwrap();
+        let git = repo();
+        let gate = FakeGate::failing();
+        let dir = logs();
+        let a = queue_branch(&conn, "feat/a", &FakeGit::commit(2));
+
+        let stopping = || true;
+        let outcome = Worker::new(&mut conn, &git, &gate, REPO, BASE, dir.path())
+            .with_interrupt(&stopping)
+            .tick()
+            .unwrap();
+
+        match outcome {
+            TickOutcome::Abandoned {
+                requeued, reason, ..
+            } => {
+                assert_eq!(requeued, 1);
+                assert_eq!(reason, Abandoned::Interrupted);
+            }
+            other => panic!("expected the candidate to be discarded, got {other:?}"),
+        }
+        assert_eq!(entry_state(&conn, a), "queued");
+        assert_eq!(
+            entry_attempts(&conn, a),
+            0,
+            "an interruption must not spend a retry"
+        );
+    }
+
+    #[test]
+    fn a_gate_failure_with_no_shutdown_pending_is_still_a_verdict() {
+        let mut conn = db::open_in_memory().unwrap();
+        let git = repo();
+        let gate = FakeGate::failing();
+        let dir = logs();
+        let a = queue_branch(&conn, "feat/a", &FakeGit::commit(2));
+
+        let running = || false;
+        let outcome = Worker::new(&mut conn, &git, &gate, REPO, BASE, dir.path())
+            .with_interrupt(&running)
+            .tick()
+            .unwrap();
+
+        assert!(
+            matches!(outcome, TickOutcome::Blamed { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(entry_attempts(&conn, a), 1);
+    }
+
     #[test]
     fn an_unfinished_candidate_built_on_a_stale_base_is_discarded() {
         let mut conn = db::open_in_memory().unwrap();
@@ -1000,5 +1222,239 @@ mod tests {
         assert_eq!(command, "run-the-gate");
         assert_eq!(exit, 0);
         assert!(log.ends_with(".log"), "the log path is recorded: {log}");
+    }
+}
+
+#[cfg(test)]
+mod loop_tests {
+    use std::cell::Cell;
+
+    use super::tests::{CONFIG, REPO, base_branch, logs, queue_branch, repo_with_gate};
+    use super::*;
+    use crate::gate::fake::FakeGate;
+    use crate::git::fake::FakeGit;
+    use crate::{db, gate};
+
+    /// No sleeping in tests: pacing is asserted directly through `pause_after`.
+    fn immediate() -> WorkOptions {
+        WorkOptions {
+            idle: Duration::ZERO,
+            give_up_after: 5,
+        }
+    }
+
+    fn ignore(_: Progress<'_>) {}
+
+    #[test]
+    fn progress_is_followed_immediately_and_quiet_is_waited_out() {
+        let idle = Duration::from_secs(7);
+
+        assert_eq!(
+            pause_after(
+                &TickOutcome::Landed {
+                    candidate: 1,
+                    entries: 1,
+                    at: FakeGit::commit(1),
+                },
+                idle
+            ),
+            Duration::ZERO
+        );
+        assert_eq!(
+            pause_after(
+                &TickOutcome::Split {
+                    failed: 1,
+                    next: 2,
+                    retrying: 1,
+                },
+                idle
+            ),
+            Duration::ZERO
+        );
+        assert_eq!(pause_after(&TickOutcome::Idle, idle), idle);
+        assert_eq!(
+            pause_after(&TickOutcome::AnotherWorkerHolds { holder_pid: 1 }, idle),
+            idle,
+            "another worker is making the progress; do not spin"
+        );
+        assert_eq!(
+            pause_after(&TickOutcome::BaseCheckedOut { holders: vec![] }, idle),
+            idle,
+            "this one needs a human, so waiting is all there is"
+        );
+    }
+
+    #[test]
+    fn progress_is_distinguished_from_having_nothing_to_do() {
+        assert!(
+            TickOutcome::Landed {
+                candidate: 1,
+                entries: 1,
+                at: FakeGit::commit(1),
+            }
+            .is_progress()
+        );
+        assert!(
+            TickOutcome::Abandoned {
+                candidate: 1,
+                requeued: 1,
+                reason: Abandoned::BaseMoved,
+            }
+            .is_progress()
+        );
+        assert!(!TickOutcome::Idle.is_progress());
+        assert!(!TickOutcome::AnotherWorkerHolds { holder_pid: 1 }.is_progress());
+        assert!(!TickOutcome::BaseCheckedOut { holders: vec![] }.is_progress());
+    }
+
+    #[test]
+    fn a_stop_asked_for_up_front_does_nothing_at_all() {
+        let mut conn = db::open_in_memory().unwrap();
+        let git = repo_with_gate(CONFIG);
+        let gate = FakeGate::passing();
+        let dir = logs();
+        queue_branch(&conn, "feat/a", &FakeGit::commit(2));
+
+        let summary = work(
+            &mut conn,
+            &git,
+            &gate,
+            REPO,
+            base_branch(),
+            dir.path(),
+            immediate(),
+            &|| true,
+            &ignore,
+        )
+        .unwrap();
+
+        assert_eq!(summary, WorkSummary::default());
+        assert!(gate.calls().is_empty());
+    }
+
+    #[test]
+    fn the_loop_runs_until_the_queue_is_empty() {
+        let mut conn = db::open_in_memory().unwrap();
+        let git = repo_with_gate(CONFIG);
+        let gate = FakeGate::passing();
+        let dir = logs();
+        queue_branch(&conn, "feat/a", &FakeGit::commit(2));
+        queue_branch(&conn, "feat/b", &FakeGit::commit(3));
+
+        let drained = Cell::new(false);
+        let summary = work(
+            &mut conn,
+            &git,
+            &gate,
+            REPO,
+            base_branch(),
+            dir.path(),
+            immediate(),
+            &|| drained.get(),
+            &|progress| {
+                if let Progress::Ticked(TickOutcome::Idle) = progress {
+                    drained.set(true);
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.entries_landed, 2);
+        assert_eq!(summary.failures, 0);
+        assert_eq!(
+            summary.ticks, 2,
+            "one tick to land the batch, one to find nothing left"
+        );
+    }
+
+    /// A gate that keeps blowing up is a worker that looks alive and achieves
+    /// nothing, so the loop gives up and says so.
+    #[test]
+    fn the_loop_gives_up_after_enough_consecutive_failures() {
+        struct AlwaysBroken;
+        impl Gate for AlwaysBroken {
+            fn run(&self, _: &str, _: &Sha, _: &Path) -> Result<gate::Verdict> {
+                Err(eyre!("the gate could not be run"))
+            }
+        }
+
+        let mut conn = db::open_in_memory().unwrap();
+        let git = repo_with_gate(CONFIG);
+        let dir = logs();
+        queue_branch(&conn, "feat/a", &FakeGit::commit(2));
+
+        let failed = work(
+            &mut conn,
+            &git,
+            &AlwaysBroken,
+            REPO,
+            base_branch(),
+            dir.path(),
+            WorkOptions {
+                idle: Duration::ZERO,
+                give_up_after: 3,
+            },
+            &|| false,
+            &ignore,
+        )
+        .unwrap_err();
+
+        let reported = format!("{failed:?}");
+        assert!(
+            reported.contains("3 consecutive failed ticks"),
+            "the error should say why it stopped: {reported}"
+        );
+    }
+
+    /// The budget counts failures in a row, not failures in total. A transient
+    /// problem must not eventually stop a healthy worker.
+    #[test]
+    fn a_failure_followed_by_success_resets_the_budget() {
+        struct BreaksTwice {
+            left: Cell<usize>,
+        }
+        impl Gate for BreaksTwice {
+            fn run(&self, _: &str, _: &Sha, _: &Path) -> Result<gate::Verdict> {
+                let left = self.left.get();
+                if left > 0 {
+                    self.left.set(left - 1);
+                    return Err(eyre!("transient trouble"));
+                }
+                Ok(gate::Verdict::Passed)
+            }
+        }
+
+        let mut conn = db::open_in_memory().unwrap();
+        let git = repo_with_gate(CONFIG);
+        let gate = BreaksTwice { left: Cell::new(2) };
+        let dir = logs();
+        queue_branch(&conn, "feat/a", &FakeGit::commit(2));
+
+        let drained = Cell::new(false);
+        let summary = work(
+            &mut conn,
+            &git,
+            &gate,
+            REPO,
+            base_branch(),
+            dir.path(),
+            WorkOptions {
+                idle: Duration::ZERO,
+                give_up_after: 3,
+            },
+            &|| drained.get(),
+            &|progress| {
+                if let Progress::Ticked(TickOutcome::Idle) = progress {
+                    drained.set(true);
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.failures, 2);
+        assert_eq!(
+            summary.entries_landed, 1,
+            "two failures in a row then success, under a budget of three"
+        );
     }
 }

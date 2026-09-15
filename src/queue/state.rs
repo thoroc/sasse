@@ -60,6 +60,16 @@ impl EntryState {
             Self::Evicted => "evicted",
         }
     }
+
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "queued" => Ok(Self::Queued),
+            "batched" => Ok(Self::Batched),
+            "merged" => Ok(Self::Merged),
+            "evicted" => Ok(Self::Evicted),
+            other => Err(eyre!("not an entry state: {other:?}")),
+        }
+    }
 }
 
 impl CandidateState {
@@ -94,6 +104,17 @@ impl CandidateState {
             Self::Passed => "passed",
             Self::Failed => "failed",
             Self::Superseded => "superseded",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "building" => Ok(Self::Building),
+            "testing" => Ok(Self::Testing),
+            "passed" => Ok(Self::Passed),
+            "failed" => Ok(Self::Failed),
+            "superseded" => Ok(Self::Superseded),
+            other => Err(eyre!("not a candidate state: {other:?}")),
         }
     }
 }
@@ -180,6 +201,28 @@ mod tests {
                 .transition_to(EntryState::Merged)
                 .is_err()
         );
+    }
+
+    /// Every state the database can hold must come back out as the same value,
+    /// or a status listing would fail on a row the schema considers valid.
+    #[test]
+    fn every_entry_state_round_trips_through_its_text_form() {
+        for state in ENTRY_STATES {
+            assert_eq!(EntryState::parse(state.as_str()).unwrap(), state);
+        }
+    }
+
+    #[test]
+    fn every_candidate_state_round_trips_through_its_text_form() {
+        for state in CANDIDATE_STATES {
+            assert_eq!(CandidateState::parse(state.as_str()).unwrap(), state);
+        }
+    }
+
+    #[test]
+    fn an_unknown_state_is_rejected_rather_than_guessed() {
+        assert!(EntryState::parse("nonsense").is_err());
+        assert!(CandidateState::parse("nonsense").is_err());
     }
 
     #[test]

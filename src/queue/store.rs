@@ -105,6 +105,110 @@ fn queued_entries(
         .collect()
 }
 
+/// An entry as a status listing needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusEntry {
+    pub id: EntryId,
+    pub branch: String,
+    pub branch_sha: Sha,
+    pub state: EntryState,
+    pub attempts: u32,
+    pub evict_reason: Option<String>,
+}
+
+/// The queue as it stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    /// Waiting, in the order they will be tried.
+    pub queued: Vec<StatusEntry>,
+    /// Currently inside a candidate.
+    pub batched: Vec<StatusEntry>,
+    /// Merged or evicted, most recently settled first.
+    pub settled: Vec<StatusEntry>,
+    pub active: Option<Candidate>,
+}
+
+/// Read the queue without changing anything.
+pub fn snapshot(
+    conn: &Connection,
+    repo_path: &str,
+    base_branch: &str,
+    settled_limit: usize,
+) -> Result<Snapshot> {
+    Ok(Snapshot {
+        queued: status_entries(
+            conn,
+            repo_path,
+            base_branch,
+            "state = 'queued'",
+            "priority DESC, id ASC",
+            None,
+        )?,
+        batched: status_entries(
+            conn,
+            repo_path,
+            base_branch,
+            "state = 'batched'",
+            "id ASC",
+            None,
+        )?,
+        settled: status_entries(
+            conn,
+            repo_path,
+            base_branch,
+            "state IN ('merged', 'evicted')",
+            "updated_at DESC, id DESC",
+            Some(settled_limit),
+        )?,
+        active: active_candidate(conn, repo_path, base_branch)?,
+    })
+}
+
+fn status_entries(
+    conn: &Connection,
+    repo_path: &str,
+    base_branch: &str,
+    predicate: &str,
+    order: &str,
+    limit: Option<usize>,
+) -> Result<Vec<StatusEntry>> {
+    // The predicate and ordering are fixed strings chosen here, never values
+    // from outside; the parameters that vary are bound.
+    let limit = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
+    let sql = format!(
+        "SELECT id, branch, branch_sha, state, attempts, evict_reason
+         FROM entry
+         WHERE repo_path = ?1 AND base_branch = ?2 AND {predicate}
+         ORDER BY {order}{limit}"
+    );
+
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map((repo_path, base_branch), |row| {
+        Ok((
+            row.get::<_, EntryId>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, u32>(4)?,
+            row.get::<_, Option<String>>(5)?,
+        ))
+    })?;
+
+    rows.collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(|(id, branch, sha, state, attempts, evict_reason)| {
+            Ok(StatusEntry {
+                id,
+                branch,
+                branch_sha: Sha::parse(&sha)?,
+                state: EntryState::parse(&state)?,
+                attempts,
+                evict_reason,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +291,77 @@ mod tests {
     fn an_empty_queue_yields_an_empty_batch() {
         let conn = db::open_in_memory().unwrap();
         assert!(select_batch(&conn, REPO, BASE, 8).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_snapshot_separates_waiting_from_batched_from_settled() {
+        let mut conn = db::open_in_memory().unwrap();
+        let waiting = queue(&conn, "feat/waiting", 1, 0);
+        let inside = queue(&conn, "feat/inside", 2, 0);
+        let gone = queue(&conn, "feat/gone", 3, 0);
+
+        let entry = Entry {
+            id: inside,
+            branch: "feat/inside".into(),
+            branch_sha: sha(2),
+            attempts: 0,
+        };
+        let candidate = open_candidate(
+            &mut conn,
+            REPO,
+            BASE,
+            &sha(200),
+            std::slice::from_ref(&entry),
+            None,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE entry SET state = 'evicted', evict_reason = 'gave up' WHERE id = ?1",
+            [gone],
+        )
+        .unwrap();
+
+        let snap = snapshot(&conn, REPO, BASE, 10).unwrap();
+        assert_eq!(
+            snap.queued.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![waiting]
+        );
+        assert_eq!(
+            snap.batched.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![inside]
+        );
+        assert_eq!(
+            snap.settled.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![gone]
+        );
+        assert_eq!(
+            snap.settled[0].evict_reason.as_deref(),
+            Some("gave up"),
+            "why an entry was evicted is part of the status"
+        );
+        assert_eq!(snap.active.map(|c| c.id), Some(candidate));
+    }
+
+    #[test]
+    fn a_snapshot_caps_how_much_history_it_returns() {
+        let conn = db::open_in_memory().unwrap();
+        for n in 1..=5u8 {
+            let id = queue(&conn, &format!("feat/{n}"), n, 0);
+            conn.execute("UPDATE entry SET state = 'merged' WHERE id = ?1", [id])
+                .unwrap();
+        }
+
+        assert_eq!(snapshot(&conn, REPO, BASE, 2).unwrap().settled.len(), 2);
+    }
+
+    #[test]
+    fn an_empty_queue_snapshots_to_nothing() {
+        let conn = db::open_in_memory().unwrap();
+        let snap = snapshot(&conn, REPO, BASE, 10).unwrap();
+        assert!(snap.queued.is_empty());
+        assert!(snap.batched.is_empty());
+        assert!(snap.settled.is_empty());
+        assert_eq!(snap.active, None);
     }
 
     #[test]

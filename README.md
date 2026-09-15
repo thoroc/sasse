@@ -42,12 +42,26 @@ additional rounds, and only when something is actually broken.
 ```sh
 sasse migrate --db queue.db
 sasse enqueue feat/my-branch --repo . --base main --db queue.db
+sasse status --repo . --base main --db queue.db
 sasse tick --repo . --base main --integration ../integration --db queue.db
+sasse work --repo . --base main --integration ../integration --db queue.db
 ```
 
 A tick takes the lease, advances the queue by at most one candidate, and gives
-the lease back. `sasse work`, a loop around it, is not written yet; until then
-drive `tick` from launchd, a git hook, or by hand.
+the lease back. `work` is a loop around `tick`: it follows progress immediately,
+waits `--interval` when there is nothing to do, and stops on an interrupt after
+finishing the candidate it is on. Ticks that fail in a row are counted, and it
+gives up after `--give-up-after` of them rather than looping forever on
+something that will never clear, such as a missing gate config.
+
+Either command can be interrupted safely. A signal reaches the gate's shell as
+well as the worker, so the gate exits non-zero, but that is recorded as an
+interruption rather than as a verdict: the candidate is discarded, its entries
+are requeued, and nobody's retry budget is charged.
+
+`status` reads the queue and changes nothing. It shows the base tip, who holds
+the lease and for how long, the candidate in flight, what is waiting, and what
+recently merged or was evicted and why.
 
 ## Configuration
 
@@ -101,6 +115,9 @@ this, so sasse refuses to move a base branch that any checkout holds.
    failed. It has already demonstrated that it fails on its own, so batching it
    again would cost every innocent entry beside it a wasted gate run and a trip
    through bisection, repeatedly, until its budget finally ran out.
+   Nor is an entry charged for anything that was not its own doing: a base that
+   moved mid-gate, a worker that died, or an interrupted gate all requeue for
+   free.
 5. Queue state is persisted. A reboot mid-batch must not lose the queue.
 6. Exactly one worker integrates into a base branch at a time, held as a lease
    with an expiry. Expiry is the authority, so a worker that wedges or dies
@@ -129,11 +146,13 @@ Early. What exists:
   verdicts the queue acts on rather than failures.
 - `src/config.rs`, the committed `sasse.toml`.
 - `src/gate.rs`, running the gate against an assembled candidate, behind a trait.
-- `src/worker.rs`, the tick: lease, assemble, gate, land or bisect, release.
+- `src/worker.rs`, the tick: lease, assemble, gate, land or bisect, release,
+  plus the loop that repeats it.
+- `src/shutdown.rs`, turning a signal into a request to stop between ticks.
 - `src/db.rs`, the migration runner.
 
-Not yet written: `sasse work` (the loop around `tick`), and any way to inspect
-the queue from the command line.
+Not yet written: any way to dequeue or reprioritise an entry by hand, and
+anything that reads the gate logs back out.
 
 ## Development
 

@@ -3,4 +3,5 @@ pub mod db;
 pub mod gate;
 pub mod git;
 pub mod queue;
+pub mod shutdown;
 pub mod worker;
