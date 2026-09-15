@@ -14,6 +14,9 @@ use std::time::{Duration, Instant};
 
 use eyre::{Result, WrapErr};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use crate::queue::store::Settled;
 
 /// A hook is bounded rather than trusted.
@@ -110,7 +113,8 @@ impl ShellNotifier {
         // Through a shell for the same reason as the gate: a hook written by
         // hand in a config file will contain pipes and quoting. `exec 2>&1`
         // merges its streams so a failure's explanation is not split in two.
-        let mut child = Command::new("/bin/sh")
+        let mut spawning = Command::new("/bin/sh");
+        spawning
             .arg("-c")
             .arg(format!("exec 2>&1\n{command}"))
             .current_dir(&self.repo)
@@ -123,9 +127,16 @@ impl ShellNotifier {
             .env("SASSE_REASON", event.reason.clone().unwrap_or_default())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .wrap_err("starting the on_settle hook")?;
+            .stderr(Stdio::null());
+
+        // Its own process group, so the timeout can reach everything the hook
+        // started and not just the shell. This is the lesson recorded in
+        // docs/salvage-from-task-spooler.md: ts puts each job in a new process
+        // group precisely so the whole tree can be signalled at once.
+        #[cfg(unix)]
+        spawning.process_group(0);
+
+        let mut child = spawning.spawn().wrap_err("starting the on_settle hook")?;
 
         // Drained on another thread so a hook that writes more than a pipe
         // buffer cannot deadlock against our own wait.
@@ -143,8 +154,12 @@ impl ShellNotifier {
                 break status;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                // The group, not just the shell. Killing only the shell can
+                // leave a descendant holding the pipe's write end, and then the
+                // drain below never sees end of file and the wait that was
+                // supposed to be bounded runs for as long as the hook would
+                // have.
+                abandon(&mut child);
                 let _ = drain.join();
                 return Ok(Delivery::TimedOut);
             }
@@ -179,6 +194,25 @@ impl Notifier for ShellNotifier {
             Err(why) => Delivery::Unrunnable(format!("{why}")),
         }
     }
+}
+
+/// Kill a timed-out hook and everything it started.
+#[cfg(unix)]
+fn abandon(child: &mut std::process::Child) {
+    let pid = child.id() as i32;
+    // SAFETY: a negative pid addresses the process group, which this child was
+    // given to itself. A group that has already gone is reported through errno
+    // rather than being undefined.
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+fn abandon(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// A notifier that does nothing, for when no hook is configured.
@@ -294,6 +328,48 @@ mod tests {
             began.elapsed() < Duration::from_secs(5),
             "waited {:?}, so the deadline did not hold",
             began.elapsed()
+        );
+    }
+
+    /// The shell cannot exec-optimise a backgrounded command, so it forks. If
+    /// only the shell is killed, the surviving child keeps the pipe's write end
+    /// open and draining its output never sees end of file.
+    #[test]
+    fn a_hook_whose_child_outlives_the_shell_is_still_killed() {
+        let notifier = here().with_timeout(Duration::from_millis(200));
+        let began = Instant::now();
+
+        let delivery = notifier.settled("sleep 30 & wait", &merged(), "/repo", "main");
+
+        assert_eq!(delivery, Delivery::TimedOut);
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "waited {:?}, so a descendant was still holding the pipe",
+            began.elapsed()
+        );
+    }
+
+    /// The timing assertions above would still pass if a descendant survived
+    /// and merely stopped holding the pipe. This asserts the operational
+    /// consequence: nothing the hook started outlives the kill.
+    #[test]
+    fn a_timed_out_hook_leaves_no_descendant_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let notifier = ShellNotifier::new(dir.path()).with_timeout(Duration::from_millis(100));
+
+        // Backgrounded, so the shell forks. The marker only appears if the
+        // child is still alive a second after the deadline.
+        notifier.settled(
+            "(sleep 1; touch survived) & wait",
+            &merged(),
+            "/repo",
+            "main",
+        );
+
+        std::thread::sleep(Duration::from_millis(1800));
+        assert!(
+            !dir.path().join("survived").exists(),
+            "a descendant outlived the group kill and kept running"
         );
     }
 
