@@ -16,6 +16,7 @@ use rusqlite::Connection;
 use crate::config::{self, Config};
 use crate::gate::{self, Gate};
 use crate::git::{self, Git, MergeOutcome, RefUpdate, Sha};
+use crate::notify::{self, Notifier};
 use crate::queue::model::Verdict as Bisection;
 use crate::queue::store::{self, Blame, Candidate};
 use crate::queue::{Acquisition, CandidateState, EntryId, bisect, lease};
@@ -58,6 +59,9 @@ pub enum TickOutcome {
         candidate: i64,
         entries: usize,
         at: Sha,
+        /// on_settle hooks that did not deliver. Reported rather than fatal: the
+        /// merge already happened and is not undone by a broken notifier.
+        hook_failures: Vec<String>,
     },
     /// The candidate was thrown away and its entries went back in the queue,
     /// spending none of their retry budget.
@@ -73,6 +77,9 @@ pub enum TickOutcome {
         branch: String,
         blame: Blame,
         reason: Fault,
+        /// As for `Landed`. Only an eviction announces anything, since a requeue
+        /// has not settled.
+        hook_failures: Vec<String>,
     },
     /// The candidate failed with more than one entry in it, so it was split and
     /// the first half will be tried next.
@@ -146,6 +153,7 @@ pub fn work(
     repo_path: &str,
     base_branch: &str,
     log_dir: &Path,
+    notifier: &dyn Notifier,
     options: WorkOptions,
     stop: &dyn Fn() -> bool,
     observe: &dyn Fn(Progress<'_>),
@@ -156,6 +164,7 @@ pub fn work(
     while !stop() {
         let ticked = Worker::new(conn, git, gate, repo_path, base_branch, log_dir)
             .with_interrupt(stop)
+            .with_notifier(notifier)
             .tick();
 
         match ticked {
@@ -238,7 +247,12 @@ pub struct Worker<'a> {
     /// Whether a stop has been asked for. Injected rather than read from
     /// process state, so a tick stays a function of its inputs.
     interrupted: &'a dyn Fn() -> bool,
+    /// Runs the on_settle hook. Only consulted when one is configured.
+    notifier: &'a dyn Notifier,
 }
+
+/// Stands in when no hook is configured, so `Worker::new` needs no notifier.
+static SILENT: notify::Silent = notify::Silent;
 
 impl<'a> Worker<'a> {
     pub fn new(
@@ -258,7 +272,14 @@ impl<'a> Worker<'a> {
             log_dir: log_dir.into(),
             lease_ttl: Duration::from_secs(300),
             interrupted: &|| false,
+            notifier: &SILENT,
         }
+    }
+
+    /// Supply the thing that runs the on_settle hook.
+    pub fn with_notifier(mut self, notifier: &'a dyn Notifier) -> Self {
+        self.notifier = notifier;
+        self
     }
 
     pub fn with_lease_ttl(mut self, ttl: Duration) -> Self {
@@ -342,7 +363,7 @@ impl<'a> Worker<'a> {
         let verdict = self.gate_candidate(&candidate, &candidate_sha, &config)?;
 
         if verdict.passed() {
-            return self.land(&candidate, &candidate_sha);
+            return self.land(&candidate, &candidate_sha, &config);
         }
 
         // A gate that died because the worker was signalled says nothing about
@@ -425,7 +446,7 @@ impl<'a> Worker<'a> {
                         candidate,
                         entry.id,
                         &entry.branch,
-                        config.max_attempts,
+                        config,
                         Fault::Conflict,
                     )?));
                 }
@@ -462,21 +483,58 @@ impl<'a> Worker<'a> {
     }
 
     /// Move the base onto the gated commit, but only if it has not moved since.
-    fn land(&mut self, candidate: &Candidate, candidate_sha: &Sha) -> Result<TickOutcome> {
+    fn land(
+        &mut self,
+        candidate: &Candidate,
+        candidate_sha: &Sha,
+        config: &Config,
+    ) -> Result<TickOutcome> {
         match self
             .git
             .fast_forward(&self.base_branch, &candidate.base_sha, candidate_sha)?
         {
             RefUpdate::Updated => {
-                let entries = store::land(self.conn, candidate.id)?;
+                let landed = store::land(self.conn, candidate.id)?;
+                // After the state is committed, so an interruption between the
+                // two loses the notification rather than the merge.
+                let hook_failures = self.announce(&landed, config);
                 Ok(TickOutcome::Landed {
                     candidate: candidate.id,
-                    entries,
+                    entries: landed.len(),
                     at: candidate_sha.clone(),
+                    hook_failures,
                 })
             }
             RefUpdate::Stale => self.abandon(candidate.id, Abandoned::BaseMoved),
         }
+    }
+
+    /// Run the on_settle hook for each entry that reached a terminal state.
+    ///
+    /// Returns the deliveries that failed. Never an error: the entries have
+    /// settled, and a notifier misbehaving does not undo that. Silent when no
+    /// hook is configured, which is the default.
+    fn announce(&mut self, settled: &[store::Settled], config: &Config) -> Vec<String> {
+        let Some(command) = &config.on_settle else {
+            return Vec::new();
+        };
+
+        settled
+            .iter()
+            .filter_map(|event| {
+                let delivery =
+                    self.notifier
+                        .settled(command, event, &self.repo_path, &self.base_branch);
+                (!delivery.delivered()).then(|| {
+                    format!(
+                        "on_settle for {} ({}): {}",
+                        event.branch,
+                        event.state.as_str(),
+                        delivery.describe()
+                    )
+                })
+            })
+            .collect()
     }
 
     fn on_gate_failure(&mut self, candidate: &Candidate, config: &Config) -> Result<TickOutcome> {
@@ -491,13 +549,7 @@ impl<'a> Worker<'a> {
                     .find(|e| e.id == entry)
                     .map(|e| e.branch.clone())
                     .unwrap_or_default();
-                self.blame(
-                    candidate,
-                    entry,
-                    &branch,
-                    config.max_attempts,
-                    Fault::GateFailed,
-                )
+                self.blame(candidate, entry, &branch, config, Fault::GateFailed)
             }
             // Someone in here is at fault but we do not know who. Halve it and
             // try the first half next; the rest goes back in the queue and will
@@ -532,20 +584,24 @@ impl<'a> Worker<'a> {
         candidate: &Candidate,
         entry: EntryId,
         branch: &str,
-        max_attempts: u32,
+        config: &Config,
         reason: Fault,
     ) -> Result<TickOutcome> {
+        let max_attempts = config.max_attempts;
         let description = match reason {
             Fault::Conflict => "conflicts with the base branch",
             Fault::GateFailed => "failed the gate on its own",
         };
-        let blame = store::blame(self.conn, candidate.id, entry, max_attempts, description)?;
+        let blamed = store::blame(self.conn, candidate.id, entry, max_attempts, description)?;
+        let hook_failures = self.announce(blamed.settled.as_slice(), config);
+
         Ok(TickOutcome::Blamed {
             candidate: candidate.id,
             entry,
             branch: branch.to_string(),
-            blame,
+            blame: blamed.verdict,
             reason,
+            hook_failures,
         })
     }
 
@@ -573,6 +629,9 @@ mod tests {
     use super::*;
     use crate::gate::fake::FakeGate;
     use crate::git::fake::FakeGit;
+    use crate::notify::Delivery;
+    use crate::notify::fake::FakeNotifier;
+    use crate::queue::EntryState;
     use crate::queue::store::Entry;
     use crate::{db, queue};
 
@@ -761,6 +820,7 @@ mod tests {
                 candidate,
                 entries,
                 at,
+                ..
             } => {
                 assert_eq!(entries, 1);
                 (candidate, at)
@@ -1090,6 +1150,196 @@ mod tests {
         assert_eq!(entry_attempts(&conn, a), 1);
     }
 
+    const HOOKED: &str = "gate = \"run-the-gate\"\non_settle = \"announce\"\n";
+
+    #[test]
+    fn a_landed_entry_is_announced_once_per_entry() {
+        let mut conn = db::open_in_memory().unwrap();
+        let git = repo_with_gate(HOOKED);
+        let gate = FakeGate::passing();
+        let notifier = FakeNotifier::working();
+        let dir = logs();
+        queue_branch(&conn, "feat/a", &FakeGit::commit(2));
+        queue_branch(&conn, "feat/b", &FakeGit::commit(3));
+
+        Worker::new(&mut conn, &git, &gate, REPO, BASE, dir.path())
+            .with_notifier(&notifier)
+            .tick()
+            .unwrap();
+
+        let seen = notifier.seen();
+        assert_eq!(
+            seen.iter().map(|s| s.branch.as_str()).collect::<Vec<_>>(),
+            vec!["feat/a", "feat/b"],
+            "two branches landed, so two announcements"
+        );
+        assert!(seen.iter().all(|s| s.state == EntryState::Merged));
+        assert!(
+            seen.iter().all(|s| s.reason.is_none()),
+            "a merge needs no explanation"
+        );
+    }
+
+    #[test]
+    fn an_eviction_is_announced_with_its_reason_and_attempts() {
+        let mut conn = db::open_in_memory().unwrap();
+        let git =
+            repo_with_gate("gate = \"run-the-gate\"\nmax_attempts = 1\non_settle = \"announce\"\n");
+        let gate = FakeGate::failing();
+        let notifier = FakeNotifier::working();
+        let dir = logs();
+        let a = queue_branch(&conn, "feat/bad", &FakeGit::commit(2));
+
+        Worker::new(&mut conn, &git, &gate, REPO, BASE, dir.path())
+            .with_notifier(&notifier)
+            .tick()
+            .unwrap();
+
+        let seen = notifier.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].entry, a);
+        assert_eq!(seen[0].state, EntryState::Evicted);
+        assert_eq!(seen[0].attempts, 1);
+        assert!(
+            seen[0]
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("failed the gate"),
+            "the reason should travel with it: {:?}",
+            seen[0].reason
+        );
+    }
+
+    /// A requeue is work that has not finished happening.
+    #[test]
+    fn a_requeued_entry_is_not_announced() {
+        let mut conn = db::open_in_memory().unwrap();
+        let git = repo_with_gate(HOOKED);
+        let gate = FakeGate::failing();
+        let notifier = FakeNotifier::working();
+        let dir = logs();
+        queue_branch(&conn, "feat/a", &FakeGit::commit(2));
+
+        let outcome = Worker::new(&mut conn, &git, &gate, REPO, BASE, dir.path())
+            .with_notifier(&notifier)
+            .tick()
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            TickOutcome::Blamed {
+                blame: Blame::Requeued,
+                ..
+            }
+        ));
+        assert!(notifier.seen().is_empty(), "nothing has settled yet");
+    }
+
+    #[test]
+    fn a_skipped_entry_is_not_announced() {
+        let mut conn = db::open_in_memory().unwrap();
+        let bad = FakeGit::commit(9);
+        let git = repo_with_gate(HOOKED).with_conflict(&bad);
+        let gate = FakeGate::passing();
+        let notifier = FakeNotifier::working();
+        let dir = logs();
+        queue_branch(&conn, "feat/good", &FakeGit::commit(2));
+        queue_branch(&conn, "feat/bad", &bad);
+
+        Worker::new(&mut conn, &git, &gate, REPO, BASE, dir.path())
+            .with_notifier(&notifier)
+            .tick()
+            .unwrap();
+
+        assert!(
+            notifier.seen().is_empty(),
+            "the culprit was requeued and its neighbour only skipped"
+        );
+    }
+
+    #[test]
+    fn nothing_is_announced_when_no_hook_is_configured() {
+        let mut conn = db::open_in_memory().unwrap();
+        let git = repo();
+        let gate = FakeGate::passing();
+        let notifier = FakeNotifier::working();
+        let dir = logs();
+        queue_branch(&conn, "feat/a", &FakeGit::commit(2));
+
+        Worker::new(&mut conn, &git, &gate, REPO, BASE, dir.path())
+            .with_notifier(&notifier)
+            .tick()
+            .unwrap();
+
+        assert!(notifier.seen().is_empty());
+    }
+
+    /// The whole failure policy: the merge stands, the tick succeeds, and the
+    /// problem is reported rather than swallowed.
+    #[test]
+    fn a_failing_hook_leaves_the_merge_intact_and_is_reported() {
+        let mut conn = db::open_in_memory().unwrap();
+        let git = repo_with_gate(HOOKED);
+        let gate = FakeGate::passing();
+        let notifier = FakeNotifier::answering(Delivery::Failed {
+            exit_code: Some(127),
+            output: "announce: command not found".into(),
+        });
+        let dir = logs();
+        let a = queue_branch(&conn, "feat/a", &FakeGit::commit(2));
+
+        let outcome = Worker::new(&mut conn, &git, &gate, REPO, BASE, dir.path())
+            .with_notifier(&notifier)
+            .tick()
+            .unwrap();
+
+        match outcome {
+            TickOutcome::Landed {
+                entries,
+                hook_failures,
+                ..
+            } => {
+                assert_eq!(entries, 1, "it still landed");
+                assert_eq!(hook_failures.len(), 1);
+                assert!(hook_failures[0].contains("feat/a"), "{hook_failures:?}");
+                assert!(
+                    hook_failures[0].contains("command not found"),
+                    "the hook's own output should explain it: {hook_failures:?}"
+                );
+            }
+            other => panic!("expected a landing, got {other:?}"),
+        }
+        assert_eq!(
+            entry_state(&conn, a),
+            "merged",
+            "a broken notifier must not undo the merge"
+        );
+    }
+
+    #[test]
+    fn a_hook_that_timed_out_is_reported_as_well() {
+        let mut conn = db::open_in_memory().unwrap();
+        let git = repo_with_gate(HOOKED);
+        let gate = FakeGate::passing();
+        let notifier = FakeNotifier::answering(Delivery::TimedOut);
+        let dir = logs();
+        queue_branch(&conn, "feat/a", &FakeGit::commit(2));
+
+        let outcome = Worker::new(&mut conn, &git, &gate, REPO, BASE, dir.path())
+            .with_notifier(&notifier)
+            .tick()
+            .unwrap();
+
+        match outcome {
+            TickOutcome::Landed { hook_failures, .. } => {
+                assert_eq!(hook_failures.len(), 1);
+                assert!(hook_failures[0].contains("killed"), "{hook_failures:?}");
+            }
+            other => panic!("expected a landing, got {other:?}"),
+        }
+    }
+
     #[test]
     fn an_unfinished_candidate_built_on_a_stale_base_is_discarded() {
         let mut conn = db::open_in_memory().unwrap();
@@ -1287,6 +1537,7 @@ mod loop_tests {
                     candidate: 1,
                     entries: 1,
                     at: FakeGit::commit(1),
+                    hook_failures: Vec::new(),
                 },
                 idle
             ),
@@ -1323,6 +1574,7 @@ mod loop_tests {
                 candidate: 1,
                 entries: 1,
                 at: FakeGit::commit(1),
+                hook_failures: Vec::new(),
             }
             .is_progress()
         );
@@ -1354,6 +1606,7 @@ mod loop_tests {
             REPO,
             base_branch(),
             dir.path(),
+            &notify::Silent,
             immediate(),
             &|| true,
             &ignore,
@@ -1381,6 +1634,7 @@ mod loop_tests {
             REPO,
             base_branch(),
             dir.path(),
+            &notify::Silent,
             immediate(),
             &|| drained.get(),
             &|progress| {
@@ -1428,6 +1682,7 @@ mod loop_tests {
             REPO,
             base_branch(),
             dir.path(),
+            &notify::Silent,
             WorkOptions {
                 idle: Duration::ZERO,
                 give_up_after: 3,
@@ -1481,6 +1736,7 @@ mod loop_tests {
             REPO,
             base_branch(),
             dir.path(),
+            &notify::Silent,
             immediate(),
             &|| stopping.get(),
             &ignore,
@@ -1532,6 +1788,7 @@ mod loop_tests {
             REPO,
             base_branch(),
             dir.path(),
+            &notify::Silent,
             WorkOptions {
                 idle: Duration::ZERO,
                 give_up_after: 3,

@@ -1108,12 +1108,27 @@ pub fn record_run(
     Ok(())
 }
 
+/// An entry that has reached a terminal state, for whoever needs telling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Settled {
+    pub entry: EntryId,
+    pub branch: String,
+    /// `Merged` or `Evicted`.
+    pub state: EntryState,
+    pub attempts: u32,
+    /// Why it was evicted. `None` on a merge, which needs no explanation.
+    pub reason: Option<String>,
+}
+
 /// The candidate passed and its commit is now the base. Everything in it landed.
-pub fn land(conn: &mut Connection, candidate_id: i64) -> Result<usize> {
+///
+/// Returns what settled, in merge order, because the entries that landed are
+/// what the on_settle hook is about and their branch names live here.
+pub fn land(conn: &mut Connection, candidate_id: i64) -> Result<Vec<Settled>> {
     let at = now_stamp();
     let tx = conn.transaction()?;
 
-    let landed = tx.execute(
+    tx.execute(
         "UPDATE candidate_entry SET outcome = 'passed' WHERE candidate_id = ?1",
         [candidate_id],
     )?;
@@ -1126,6 +1141,26 @@ pub fn land(conn: &mut Connection, candidate_id: i64) -> Result<usize> {
         "UPDATE candidate SET state = 'passed', updated_at = ?2 WHERE id = ?1",
         (candidate_id, &at),
     )?;
+
+    let landed = {
+        let mut statement = tx.prepare(
+            "SELECT e.id, e.branch, e.attempts
+             FROM candidate_entry ce
+             JOIN entry e ON e.id = ce.entry_id
+             WHERE ce.candidate_id = ?1
+             ORDER BY ce.position ASC",
+        )?;
+        let rows = statement.query_map([candidate_id], |row| {
+            Ok(Settled {
+                entry: row.get(0)?,
+                branch: row.get(1)?,
+                state: EntryState::Merged,
+                attempts: row.get(2)?,
+                reason: None,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
 
     tx.commit()?;
     Ok(landed)
@@ -1168,6 +1203,15 @@ pub enum Blame {
     Requeued,
 }
 
+/// The result of pinning a failed candidate on one entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blamed {
+    pub verdict: Blame,
+    /// Present only when the culprit was evicted. A requeue has not settled, so
+    /// there is nothing to announce yet.
+    pub settled: Option<Settled>,
+}
+
 /// Pin a failed candidate on one entry.
 ///
 /// The culprit spends an attempt and is evicted once its budget is gone.
@@ -1180,7 +1224,7 @@ pub fn blame(
     culprit: EntryId,
     max_attempts: u32,
     reason: &str,
-) -> Result<Blame> {
+) -> Result<Blamed> {
     let at = now_stamp();
     let tx = conn.transaction()?;
 
@@ -1237,8 +1281,25 @@ pub fn blame(
         (candidate_id, &at),
     )?;
 
+    let settled = match verdict {
+        Blame::Requeued => None,
+        Blame::Evicted => {
+            let branch: String =
+                tx.query_row("SELECT branch FROM entry WHERE id = ?1", [culprit], |row| {
+                    row.get(0)
+                })?;
+            Some(Settled {
+                entry: culprit,
+                branch,
+                state: EntryState::Evicted,
+                attempts: spent,
+                reason: Some(reason.to_string()),
+            })
+        }
+    };
+
     tx.commit()?;
-    Ok(verdict)
+    Ok(Blamed { verdict, settled })
 }
 
 fn set_candidate(

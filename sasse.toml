@@ -18,3 +18,9 @@ log_budget = "200MB"
 # Most bytes of any one gate log. Beyond this the log keeps its head and its
 # tail and loses the middle, so no single run can fill the whole budget.
 max_log_size = "2MB"
+
+# Run once for each entry that merges or is evicted. Optional; left unset here
+# because sasse's own queue has nobody to notify. The branch, outcome, attempts
+# and eviction reason arrive in the environment. See docs/adr/on-settle-hook.md.
+#
+# on_settle = "terminal-notifier -message \"$SASSE_BRANCH $SASSE_OUTCOME\""

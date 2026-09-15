@@ -92,6 +92,47 @@ reading `removed by hand`, so a decision stays distinguishable from a verdict.
 `logs` with no argument lists recent gate runs with their verdicts; with a
 candidate it prints that candidate's runs and the tail of the last one.
 
+## Being told when something settles
+
+`sasse work` is meant to be left running, and without a hook nothing it does
+reaches the person who queued a branch. The failure that matters is silent
+eviction: a branch queued and then evicted looks, from outside, exactly like one
+still waiting, because neither has landed.
+
+`on_settle` is a command run once for each entry that merges or is evicted. It
+is optional, and unset means nothing runs. The context arrives in the
+environment:
+
+| variable | meaning |
+| --- | --- |
+| `SASSE_BRANCH` | the branch that settled |
+| `SASSE_OUTCOME` | `merged` or `evicted` |
+| `SASSE_REASON` | why it was evicted; empty on a merge |
+| `SASSE_ATTEMPTS` | how many attempts it spent |
+| `SASSE_ENTRY` | the entry number |
+| `SASSE_REPO`, `SASSE_BASE` | which queue |
+
+A requeue or a skip announces nothing, being work that has not finished
+happening. `sasse dequeue` announces nothing either: you do not need telling
+about a removal you performed yourself.
+
+A hook that fails is reported alongside the outcome and never instead of it. The
+merge or the eviction already happened and is not undone by a broken notifier,
+so the tick still succeeds and the failure appears as an extra line:
+
+```text
+candidate 7 passed; 1 entr(ies) landed at 96a9617
+  on_settle for feat-c (merged): exited 127: definitely-not-a-command: not found
+```
+
+A hook is also bounded by a ten second timeout, which matters more than the exit
+code: one that curls a URL with no timeout of its own, or that prompts, would
+otherwise hold the tick open indefinitely and wedge the queue far more
+thoroughly than any missed notification. It is read from the base branch tip like
+the gate, so a queued branch cannot introduce a command the worker will run. The
+reasoning and the rejected alternatives are in
+[docs/adr/on-settle-hook.md](docs/adr/on-settle-hook.md).
+
 ## Log retention
 
 Gate logs are the only thing in the queue that grows without bound, and how fast
@@ -130,6 +171,7 @@ max_batch = 8
 max_attempts = 3
 log_budget = "200MB"
 max_log_size = "2MB"
+on_settle = "terminal-notifier -message \"$SASSE_BRANCH $SASSE_OUTCOME\""
 ```
 
 Only `gate` is required. Sizes may be written as `200MB`, `512KB` or a plain
@@ -209,6 +251,7 @@ Early. What exists:
 - `src/logs.rs`, reading a log's tail and deciding which logs go.
 - `src/retention.rs`, applying that decision to the database and the disk.
 - `src/gate.rs`, running the gate against an assembled candidate, behind a trait.
+- `src/notify.rs`, running the on_settle hook with a bounded timeout.
 - `src/worker.rs`, the tick: lease, assemble, gate, land or bisect, release,
   plus the loop that repeats it.
 - `src/shutdown.rs`, turning a signal into a request to stop between ticks.

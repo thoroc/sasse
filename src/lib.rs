@@ -4,6 +4,7 @@ pub mod db;
 pub mod gate;
 pub mod git;
 pub mod logs;
+pub mod notify;
 pub mod queue;
 pub mod retention;
 pub mod shutdown;

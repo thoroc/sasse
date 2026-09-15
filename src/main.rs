@@ -13,7 +13,7 @@ use sasse::logs::{self, Because, Plan};
 use sasse::queue::store::{Amendment, Run, Snapshot, StatusEntry};
 use sasse::queue::{lease, store};
 use sasse::worker::{Progress, TickOutcome, WorkOptions, Worker, work};
-use sasse::{db, gate, retention, shutdown};
+use sasse::{db, gate, notify, retention, shutdown};
 
 #[derive(Parser)]
 #[command(
@@ -189,6 +189,7 @@ fn main() -> Result<()> {
             let git = CommandGit::new(&repo, &integration.integration);
             let shell = gate::ShellGate::new(&integration.integration);
 
+            let notifier = notify::ShellNotifier::new(&repo);
             let outcome = Worker::new(
                 &mut conn,
                 &git,
@@ -198,6 +199,7 @@ fn main() -> Result<()> {
                 &integration.logs,
             )
             .with_interrupt(&shutdown::requested)
+            .with_notifier(&notifier)
             .tick()?;
             println!("{}", describe(&outcome));
         }
@@ -230,6 +232,7 @@ fn main() -> Result<()> {
                 &repo,
                 &target.base,
                 &integration.logs,
+                &notify::ShellNotifier::new(&repo),
                 WorkOptions {
                     idle: Duration::from_secs(interval),
                     give_up_after,
@@ -460,9 +463,13 @@ fn describe(outcome: &TickOutcome) -> String {
             candidate,
             entries,
             at,
-        } => format!(
-            "candidate {candidate} passed; {entries} entr(ies) landed at {}",
-            short(at)
+            hook_failures,
+        } => with_hook_failures(
+            format!(
+                "candidate {candidate} passed; {entries} entr(ies) landed at {}",
+                short(at)
+            ),
+            hook_failures,
         ),
 
         TickOutcome::Abandoned {
@@ -478,8 +485,12 @@ fn describe(outcome: &TickOutcome) -> String {
             branch,
             blame,
             reason,
+            hook_failures,
             ..
-        } => format!("candidate {candidate} failed: {branch} {reason:?}, {blame:?}"),
+        } => with_hook_failures(
+            format!("candidate {candidate} failed: {branch} {reason:?}, {blame:?}"),
+            hook_failures,
+        ),
 
         TickOutcome::Split {
             failed,
@@ -645,6 +656,16 @@ fn print_entries(heading: &str, entries: &[StatusEntry], budget: Option<u32>) {
             suffix
         );
     }
+}
+
+/// A hook that failed is reported alongside the outcome, never instead of it:
+/// the merge or the eviction happened regardless.
+fn with_hook_failures(mut line: String, failures: &[String]) -> String {
+    for failure in failures {
+        line.push_str("\n  ");
+        line.push_str(failure);
+    }
+    line
 }
 
 fn print_runs(runs: &[Run]) {

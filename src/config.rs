@@ -51,6 +51,14 @@ pub struct Config {
     /// everything else, leaving a history one entry deep.
     #[serde(default = "default_max_log_size")]
     pub max_log_size: ByteSize,
+
+    /// Run once for each entry that merges or is evicted.
+    ///
+    /// Optional, and absent means nothing is run. Read from the base branch tip
+    /// like the gate, so a queued branch cannot introduce a command the worker
+    /// will execute. See `docs/adr/on-settle-hook.md`.
+    #[serde(default)]
+    pub on_settle: Option<String>,
 }
 
 fn default_max_batch() -> usize {
@@ -93,6 +101,13 @@ impl Config {
             ));
         }
 
+        if let Some(hook) = &config.on_settle
+            && hook.trim().is_empty()
+        {
+            return Err(eyre!(
+                "{CONFIG_PATH} declares an empty on_settle; remove the setting instead"
+            ));
+        }
         if config.max_log_size.bytes() == 0 {
             return Err(eyre!(
                 "{CONFIG_PATH} sets max_log_size to 0, which would keep no gate output at all"
@@ -159,6 +174,24 @@ mod tests {
             format!("{rejected}").contains("could not hold even one log"),
             "the error should explain itself: {rejected}"
         );
+    }
+
+    #[test]
+    fn a_settle_hook_is_optional() {
+        assert_eq!(Config::parse(r#"gate = "x""#).unwrap().on_settle, None);
+    }
+
+    #[test]
+    fn a_settle_hook_is_taken_as_written() {
+        let config = Config::parse("gate = \"x\"\non_settle = \"notify $SASSE_BRANCH\"").unwrap();
+        assert_eq!(config.on_settle.as_deref(), Some("notify $SASSE_BRANCH"));
+    }
+
+    /// An empty string would spawn a shell to do nothing, which is a typo rather
+    /// than an intention.
+    #[test]
+    fn an_empty_settle_hook_is_rejected() {
+        assert!(Config::parse("gate = \"x\"\non_settle = \"  \"").is_err());
     }
 
     #[test]
