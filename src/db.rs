@@ -12,6 +12,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
         3,
         include_str!("../migrations/0003_candidate_without_a_commit.sql"),
     ),
+    (4, include_str!("../migrations/0004_retained_log_tail.sql")),
 ];
 
 pub fn open(path: &Path) -> Result<Connection> {

@@ -9,3 +9,12 @@ max_batch = 8
 # How many times an entry may be the culprit of a failed candidate before it is
 # evicted from the queue.
 max_attempts = 3
+
+# Most bytes the gate log directory may hold. A hard ceiling: a passing
+# candidate's log goes as soon as it settles, then the oldest failures go until
+# the directory is under budget. See docs/adr/log-retention.md.
+log_budget = "200MB"
+
+# Most bytes of any one gate log. Beyond this the log keeps its head and its
+# tail and loses the middle, so no single run can fill the whole budget.
+max_log_size = "2MB"

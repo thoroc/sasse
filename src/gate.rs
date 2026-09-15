@@ -4,12 +4,15 @@
 //! decisions can be tested without waiting on a real test suite, and so a
 //! failing gate can be arranged exactly rather than approximated.
 
+use std::collections::VecDeque;
 use std::fs::File;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use eyre::{Result, WrapErr};
 
+use crate::bytes::ByteSize;
 use crate::git::Sha;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,13 +31,19 @@ impl Verdict {
 }
 
 pub trait Gate {
-    /// Run `command` against the candidate currently checked out, writing its
-    /// combined output to `log_path`.
+    /// Run `command` against the candidate currently checked out, writing at
+    /// most `max_log_size` bytes of its combined output to `log_path`.
     ///
     /// The candidate id is passed so the run can be identified in logs. The
     /// gate is not expected to use it to find the code: the code is whatever is
     /// checked out.
-    fn run(&self, command: &str, candidate: &Sha, log_path: &Path) -> Result<Verdict>;
+    fn run(
+        &self,
+        command: &str,
+        candidate: &Sha,
+        log_path: &Path,
+        max_log_size: ByteSize,
+    ) -> Result<Verdict>;
 }
 
 /// Runs the gate through a shell, in the integration checkout.
@@ -51,7 +60,13 @@ impl ShellGate {
 }
 
 impl Gate for ShellGate {
-    fn run(&self, command: &str, candidate: &Sha, log_path: &Path) -> Result<Verdict> {
+    fn run(
+        &self,
+        command: &str,
+        candidate: &Sha,
+        log_path: &Path,
+        max_log_size: ByteSize,
+    ) -> Result<Verdict> {
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent)
                 .wrap_err_with(|| format!("creating the log directory {}", parent.display()))?;
@@ -59,25 +74,44 @@ impl Gate for ShellGate {
 
         let log = File::create(log_path)
             .wrap_err_with(|| format!("creating the gate log {}", log_path.display()))?;
-        let errors = log
-            .try_clone()
-            .wrap_err("duplicating the gate log handle for stderr")?;
 
-        // Through a shell, because the gate is written by a human in a config
-        // file and will contain pipes, &&, and shell quoting.
-        let status = Command::new("/bin/sh")
+        // `exec 2>&1` merges the gate's stderr into its stdout inside the shell,
+        // so the parent reads one stream and the cap applies to the output as a
+        // whole rather than to each half separately.
+        let mut child = Command::new("/bin/sh")
             .arg("-c")
-            .arg(command)
+            .arg(format!("exec 2>&1\n{command}"))
             .current_dir(&self.integration)
             .env("SASSE_CANDIDATE", candidate.as_str())
             // stdin closed: a gate that waits for input would hang the queue
             // with no indication of why.
             .stdin(Stdio::null())
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(errors))
-            .status()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
             .wrap_err_with(|| format!("running the gate: {command}"))?;
 
+        let mut output = child.stdout.take().expect("stdout was piped");
+        let mut capped = Capped::new(log, max_log_size);
+        let mut buffer = [0u8; 16 * 1024];
+
+        loop {
+            let read = output
+                .read(&mut buffer)
+                .wrap_err("reading the gate's output")?;
+            if read == 0 {
+                break;
+            }
+            capped
+                .take(&buffer[..read])
+                .wrap_err_with(|| format!("writing the gate log {}", log_path.display()))?;
+        }
+
+        capped
+            .finish()
+            .wrap_err_with(|| format!("finishing the gate log {}", log_path.display()))?;
+
+        let status = child.wait().wrap_err("waiting for the gate")?;
         if status.success() {
             Ok(Verdict::Passed)
         } else {
@@ -85,6 +119,70 @@ impl Gate for ShellGate {
                 exit_code: status.code(),
             })
         }
+    }
+}
+
+/// Writes a stream to a file, keeping its beginning and its end.
+///
+/// The head carries the gate command's own startup output, where a
+/// misconfigured gate announces itself; the tail carries the failure. The
+/// middle of a test run is almost always the cases that passed. Written as a
+/// single pass so an enormous log never lands on disk in full, which is the
+/// point: truncating afterwards would mean having stored it first.
+struct Capped {
+    file: File,
+    head_room: usize,
+    tail: VecDeque<u8>,
+    tail_capacity: usize,
+    dropped: u64,
+}
+
+impl Capped {
+    fn new(file: File, cap: ByteSize) -> Self {
+        // Split the allowance between the two ends. At least one byte each, so
+        // a nonsensically small cap still behaves.
+        let half = (cap.bytes() / 2).max(1) as usize;
+        Self {
+            file,
+            head_room: half,
+            tail: VecDeque::with_capacity(half.min(64 * 1024)),
+            tail_capacity: half,
+            dropped: 0,
+        }
+    }
+
+    fn take(&mut self, chunk: &[u8]) -> std::io::Result<()> {
+        let mut rest = chunk;
+
+        if self.head_room > 0 {
+            let take = self.head_room.min(rest.len());
+            self.file.write_all(&rest[..take])?;
+            self.head_room -= take;
+            rest = &rest[take..];
+        }
+
+        for byte in rest {
+            if self.tail.len() == self.tail_capacity {
+                self.tail.pop_front();
+                self.dropped += 1;
+            }
+            self.tail.push_back(*byte);
+        }
+
+        Ok(())
+    }
+
+    fn finish(mut self) -> std::io::Result<()> {
+        if self.dropped > 0 {
+            write!(
+                self.file,
+                "\n[sasse dropped {} bytes from the middle of this log]\n",
+                self.dropped
+            )?;
+        }
+        let tail: Vec<u8> = self.tail.into_iter().collect();
+        self.file.write_all(&tail)?;
+        self.file.flush()
     }
 }
 
@@ -140,7 +238,13 @@ pub mod fake {
     }
 
     impl Gate for FakeGate {
-        fn run(&self, command: &str, candidate: &Sha, _log_path: &Path) -> Result<Verdict> {
+        fn run(
+            &self,
+            command: &str,
+            candidate: &Sha,
+            _log_path: &Path,
+            _max_log_size: ByteSize,
+        ) -> Result<Verdict> {
             self.calls
                 .lock()
                 .unwrap()
@@ -159,6 +263,8 @@ pub mod fake {
 mod tests {
     use super::*;
 
+    const GENEROUS: ByteSize = ByteSize::new(1024 * 1024);
+
     fn candidate() -> Sha {
         Sha::parse(&"ab".repeat(20)).unwrap()
     }
@@ -170,7 +276,7 @@ mod tests {
         let log = dir.path().join("logs/run.log");
 
         assert_eq!(
-            gate.run("true", &candidate(), &log).unwrap(),
+            gate.run("true", &candidate(), &log, GENEROUS).unwrap(),
             Verdict::Passed
         );
     }
@@ -181,8 +287,13 @@ mod tests {
         let gate = ShellGate::new(dir.path());
 
         assert_eq!(
-            gate.run("exit 3", &candidate(), &dir.path().join("run.log"))
-                .unwrap(),
+            gate.run(
+                "exit 3",
+                &candidate(),
+                &dir.path().join("run.log"),
+                GENEROUS
+            )
+            .unwrap(),
             Verdict::Failed { exit_code: Some(3) }
         );
     }
@@ -193,7 +304,7 @@ mod tests {
         let gate = ShellGate::new(dir.path());
         let log = dir.path().join("run.log");
 
-        gate.run("echo out; echo err 1>&2", &candidate(), &log)
+        gate.run("echo out; echo err 1>&2", &candidate(), &log, GENEROUS)
             .unwrap();
 
         let captured = std::fs::read_to_string(&log).unwrap();
@@ -207,7 +318,7 @@ mod tests {
         let gate = ShellGate::new(dir.path());
         let log = dir.path().join("deep/nested/run.log");
 
-        gate.run("true", &candidate(), &log).unwrap();
+        gate.run("true", &candidate(), &log, GENEROUS).unwrap();
         assert!(log.exists());
     }
 
@@ -218,8 +329,13 @@ mod tests {
         let gate = ShellGate::new(dir.path());
 
         assert_eq!(
-            gate.run("test -f marker", &candidate(), &dir.path().join("run.log"))
-                .unwrap(),
+            gate.run(
+                "test -f marker",
+                &candidate(),
+                &dir.path().join("run.log"),
+                GENEROUS
+            )
+            .unwrap(),
             Verdict::Passed
         );
     }
@@ -232,9 +348,8 @@ mod tests {
         let gate = ShellGate::new(dir.path());
         let log = dir.path().join("run.log");
 
-        // Reading from a closed stdin returns end of file immediately.
         assert_eq!(
-            gate.run("read line", &candidate(), &log).unwrap(),
+            gate.run("read line", &candidate(), &log, GENEROUS).unwrap(),
             Verdict::Failed { exit_code: Some(1) }
         );
     }
@@ -246,7 +361,119 @@ mod tests {
         let log = dir.path().join("run.log");
         let c = candidate();
 
-        gate.run("echo $SASSE_CANDIDATE", &c, &log).unwrap();
+        gate.run("echo $SASSE_CANDIDATE", &c, &log, GENEROUS)
+            .unwrap();
         assert!(std::fs::read_to_string(&log).unwrap().contains(c.as_str()));
+    }
+
+    /// Under the cap, the log must be exactly what the gate wrote.
+    #[test]
+    fn a_log_within_the_cap_is_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = ShellGate::new(dir.path());
+        let log = dir.path().join("run.log");
+
+        gate.run("printf 'hello\\n'", &candidate(), &log, GENEROUS)
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "hello\n");
+        assert!(
+            !std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("sasse dropped"),
+            "nothing was dropped, so nothing should say so"
+        );
+    }
+
+    #[test]
+    fn a_log_over_the_cap_keeps_its_head_and_its_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = ShellGate::new(dir.path());
+        let log = dir.path().join("run.log");
+
+        // 20,000 lines of six bytes each, far past a 4KB cap.
+        gate.run(
+            "for i in $(seq 1 20000); do printf 'L%05d\\n' \"$i\"; done",
+            &candidate(),
+            &log,
+            ByteSize::new(4096),
+        )
+        .unwrap();
+
+        let kept = std::fs::read_to_string(&log).unwrap();
+        assert!(kept.contains("L00001"), "the head is missing");
+        assert!(kept.contains("L20000"), "the tail is missing");
+        assert!(
+            !kept.contains("L10000"),
+            "the middle should have gone, not been kept"
+        );
+        assert!(
+            kept.contains("sasse dropped"),
+            "a truncated log must say so: {}",
+            &kept[..kept.len().min(200)]
+        );
+    }
+
+    /// The cap is the point, so it has to actually hold.
+    #[test]
+    fn a_capped_log_stays_near_the_cap_however_much_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = ShellGate::new(dir.path());
+        let log = dir.path().join("run.log");
+        let cap = ByteSize::new(4096);
+
+        gate.run(
+            "for i in $(seq 1 50000); do printf 'L%05d\\n' \"$i\"; done",
+            &candidate(),
+            &log,
+            cap,
+        )
+        .unwrap();
+
+        let size = std::fs::metadata(&log).unwrap().len();
+        let marker_allowance = 128;
+        assert!(
+            size <= cap.bytes() + marker_allowance,
+            "log grew to {size} bytes against a cap of {cap}"
+        );
+    }
+
+    /// A gate whose whole output is one enormous line must still be bounded,
+    /// which is why the cap is in bytes rather than lines.
+    #[test]
+    fn a_single_enormous_line_is_still_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = ShellGate::new(dir.path());
+        let log = dir.path().join("run.log");
+        let cap = ByteSize::new(2048);
+
+        gate.run(
+            "for i in $(seq 1 20000); do printf 'xxxxxxxxxx'; done",
+            &candidate(),
+            &log,
+            cap,
+        )
+        .unwrap();
+
+        let size = std::fs::metadata(&log).unwrap().len();
+        assert!(size <= cap.bytes() + 128, "one line grew to {size} bytes");
+    }
+
+    #[test]
+    fn a_verdict_is_unaffected_by_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = ShellGate::new(dir.path());
+        let log = dir.path().join("run.log");
+
+        let verdict = gate
+            .run(
+                "for i in $(seq 1 5000); do echo noise; done; exit 7",
+                &candidate(),
+                &log,
+                ByteSize::new(1024),
+            )
+            .unwrap();
+
+        assert_eq!(verdict, Verdict::Failed { exit_code: Some(7) });
     }
 }

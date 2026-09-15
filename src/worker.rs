@@ -19,6 +19,7 @@ use crate::git::{self, Git, MergeOutcome, RefUpdate, Sha};
 use crate::queue::model::Verdict as Bisection;
 use crate::queue::store::{self, Blame, Candidate};
 use crate::queue::{Acquisition, CandidateState, EntryId, bisect, lease};
+use crate::retention;
 
 /// Why a candidate was abandoned without blaming anything in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,6 +309,20 @@ impl<'a> Worker<'a> {
         let base_sha = self.git.resolve(&self.base_branch)?;
         let config = self.read_config(&base_sha)?;
 
+        // Before assembling anything, not after settling it. A log directory
+        // that cannot be written to should fail a tick that has done nothing
+        // yet, rather than one that has just landed a candidate: reporting
+        // "tick failed" immediately after a successful merge would be worse
+        // than useless. The cost is that a passing candidate's log survives
+        // until the following tick, which nobody can observe.
+        retention::apply(
+            self.conn,
+            &self.repo_path,
+            &self.base_branch,
+            config.log_budget,
+        )
+        .wrap_err("keeping the gate logs inside their budget")?;
+
         let Some(candidate) = self.candidate_to_work_on(&base_sha, &config)? else {
             return Ok(TickOutcome::Idle);
         };
@@ -427,7 +442,9 @@ impl<'a> Worker<'a> {
         config: &Config,
     ) -> Result<gate::Verdict> {
         let log_path = self.log_dir.join(format!("candidate-{}.log", candidate.id));
-        let verdict = self.gate.run(&config.gate, candidate_sha, &log_path)?;
+        let verdict = self
+            .gate
+            .run(&config.gate, candidate_sha, &log_path, config.max_log_size)?;
 
         let exit_code = match &verdict {
             gate::Verdict::Passed => Some(0),
@@ -974,7 +991,13 @@ mod tests {
             git: &'g FakeGit,
         }
         impl Gate for MovesTheBase<'_> {
-            fn run(&self, _command: &str, _candidate: &Sha, _log: &Path) -> Result<gate::Verdict> {
+            fn run(
+                &self,
+                _command: &str,
+                _candidate: &Sha,
+                _log: &Path,
+                _cap: crate::bytes::ByteSize,
+            ) -> Result<gate::Verdict> {
                 self.git
                     .force_branch("refs/heads/main", &FakeGit::commit(77));
                 Ok(gate::Verdict::Passed)
@@ -1382,7 +1405,13 @@ mod loop_tests {
     fn the_loop_gives_up_after_enough_consecutive_failures() {
         struct AlwaysBroken;
         impl Gate for AlwaysBroken {
-            fn run(&self, _: &str, _: &Sha, _: &Path) -> Result<gate::Verdict> {
+            fn run(
+                &self,
+                _: &str,
+                _: &Sha,
+                _: &Path,
+                _: crate::bytes::ByteSize,
+            ) -> Result<gate::Verdict> {
                 Err(eyre!("the gate could not be run"))
             }
         }
@@ -1423,7 +1452,13 @@ mod loop_tests {
             stopping: &'a Cell<bool>,
         }
         impl Gate for DiesOnTheSignal<'_> {
-            fn run(&self, _: &str, _: &Sha, _: &Path) -> Result<gate::Verdict> {
+            fn run(
+                &self,
+                _: &str,
+                _: &Sha,
+                _: &Path,
+                _: crate::bytes::ByteSize,
+            ) -> Result<gate::Verdict> {
                 // The signal arrives while the gate is running, killing it.
                 self.stopping.set(true);
                 Err(eyre!("killed"))
@@ -1467,7 +1502,13 @@ mod loop_tests {
             left: Cell<usize>,
         }
         impl Gate for BreaksTwice {
-            fn run(&self, _: &str, _: &Sha, _: &Path) -> Result<gate::Verdict> {
+            fn run(
+                &self,
+                _: &str,
+                _: &Sha,
+                _: &Path,
+                _: crate::bytes::ByteSize,
+            ) -> Result<gate::Verdict> {
                 let left = self.left.get();
                 if left > 0 {
                     self.left.set(left - 1);

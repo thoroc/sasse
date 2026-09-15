@@ -10,6 +10,8 @@
 use eyre::{Result, WrapErr, eyre};
 use serde::Deserialize;
 
+use crate::bytes::ByteSize;
+
 /// Where the configuration lives, relative to the repository root.
 pub const CONFIG_PATH: &str = "sasse.toml";
 
@@ -33,6 +35,22 @@ pub struct Config {
     /// a genuinely broken branch blocks the queue.
     #[serde(default = "default_max_attempts")]
     pub max_attempts: u32,
+
+    /// Most bytes the gate log directory may hold.
+    ///
+    /// A hard ceiling rather than a guideline. Pruning spends it verdict-first:
+    /// a passing candidate's log goes as soon as it lands, since nobody reads a
+    /// green gate log, and only then are the oldest failures removed.
+    #[serde(default = "default_log_budget")]
+    pub log_budget: ByteSize,
+
+    /// Most bytes of any one gate log.
+    ///
+    /// Beyond this a log keeps its head and its tail and loses the middle.
+    /// Without it a single pathological run can fill the whole budget and evict
+    /// everything else, leaving a history one entry deep.
+    #[serde(default = "default_max_log_size")]
+    pub max_log_size: ByteSize,
 }
 
 fn default_max_batch() -> usize {
@@ -41,6 +59,14 @@ fn default_max_batch() -> usize {
 
 fn default_max_attempts() -> u32 {
     3
+}
+
+fn default_log_budget() -> ByteSize {
+    ByteSize::new(200 * 1024 * 1024)
+}
+
+fn default_max_log_size() -> ByteSize {
+    ByteSize::new(2 * 1024 * 1024)
 }
 
 impl Config {
@@ -67,6 +93,20 @@ impl Config {
             ));
         }
 
+        if config.max_log_size.bytes() == 0 {
+            return Err(eyre!(
+                "{CONFIG_PATH} sets max_log_size to 0, which would keep no gate output at all"
+            ));
+        }
+        if config.log_budget < config.max_log_size {
+            return Err(eyre!(
+                "{CONFIG_PATH} sets log_budget to {} and max_log_size to {}, \
+                 so the budget could not hold even one log",
+                config.log_budget,
+                config.max_log_size
+            ));
+        }
+
         Ok(config)
     }
 }
@@ -81,6 +121,49 @@ mod tests {
         assert_eq!(config.gate, "cargo test");
         assert_eq!(config.max_batch, default_max_batch());
         assert_eq!(config.max_attempts, default_max_attempts());
+    }
+
+    #[test]
+    fn the_log_settings_have_defaults_so_existing_configs_keep_working() {
+        let config = Config::parse(r#"gate = "cargo test""#).unwrap();
+        assert_eq!(config.log_budget, default_log_budget());
+        assert_eq!(config.max_log_size, default_max_log_size());
+    }
+
+    #[test]
+    fn the_log_settings_accept_sizes_as_people_write_them() {
+        let config = Config::parse(
+            r#"
+            gate = "cargo test"
+            log_budget = "1GB"
+            max_log_size = "512KB"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.log_budget.bytes(), 1024 * 1024 * 1024);
+        assert_eq!(config.max_log_size.bytes(), 512 * 1024);
+    }
+
+    /// A budget smaller than one log is a policy that can never be satisfied.
+    #[test]
+    fn a_budget_that_cannot_hold_one_log_is_rejected() {
+        let rejected = Config::parse(
+            r#"
+            gate = "cargo test"
+            log_budget = "1MB"
+            max_log_size = "2MB"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{rejected}").contains("could not hold even one log"),
+            "the error should explain itself: {rejected}"
+        );
+    }
+
+    #[test]
+    fn a_zero_log_cap_is_rejected() {
+        assert!(Config::parse("gate = \"x\"\nmax_log_size = 0").is_err());
     }
 
     #[test]

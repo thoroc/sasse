@@ -312,16 +312,71 @@ pub struct Run {
     pub candidate_id: i64,
     pub command: String,
     pub exit_code: Option<i32>,
-    /// The log outlives this row, so it may point at a file that is still there
-    /// long after the queue has forgotten why it mattered.
+    /// `None` once the log has been pruned.
     pub log_path: Option<String>,
+    /// The last lines of the log, kept when a failure's file was removed, so
+    /// the reason outlives the bytes.
+    pub tail: Option<String>,
     pub started_at: String,
+}
+
+/// A run whose log is still on disk, belonging to a candidate that has settled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoggedRun {
+    pub run_id: i64,
+    pub candidate_id: i64,
+    pub log_path: String,
+    pub passed: bool,
+}
+
+/// Every log that may legally be pruned.
+///
+/// A candidate still being assembled or gated is excluded: its log is being
+/// written to, and the worker is going to want it.
+pub fn logged_runs(
+    conn: &Connection,
+    repo_path: &str,
+    base_branch: &str,
+) -> Result<Vec<LoggedRun>> {
+    let mut statement = conn.prepare(
+        "SELECT r.id, r.candidate_id, r.log_path, r.exit_code
+         FROM run r
+         JOIN candidate c ON c.id = r.candidate_id
+         WHERE c.repo_path = ?1
+           AND c.base_branch = ?2
+           AND r.log_path IS NOT NULL
+           AND c.state IN ('passed', 'failed', 'superseded')
+         ORDER BY r.id ASC",
+    )?;
+
+    let rows = statement.query_map((repo_path, base_branch), |row| {
+        Ok(LoggedRun {
+            run_id: row.get(0)?,
+            candidate_id: row.get(1)?,
+            log_path: row.get(2)?,
+            passed: row.get::<_, Option<i32>>(3)? == Some(0),
+        })
+    })?;
+
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Record that a log is gone, keeping its tail if there was anything to keep.
+///
+/// Called before the file is deleted, so a crash between the two leaves the
+/// explanation behind rather than losing both.
+pub fn forget_log(conn: &Connection, run_id: i64, tail: Option<&str>) -> Result<()> {
+    conn.execute(
+        "UPDATE run SET log_path = NULL, tail = ?2 WHERE id = ?1",
+        (run_id, tail),
+    )?;
+    Ok(())
 }
 
 /// Gate runs for one candidate, oldest first.
 pub fn runs(conn: &Connection, candidate_id: i64) -> Result<Vec<Run>> {
     let mut statement = conn.prepare(
-        "SELECT id, candidate_id, command, exit_code, log_path, started_at
+        "SELECT id, candidate_id, command, exit_code, log_path, tail, started_at
          FROM run WHERE candidate_id = ?1 ORDER BY id ASC",
     )?;
     let rows = statement.query_map([candidate_id], row_to_run)?;
@@ -336,7 +391,8 @@ pub fn recent_runs(
     limit: usize,
 ) -> Result<Vec<Run>> {
     let mut statement = conn.prepare(
-        "SELECT r.id, r.candidate_id, r.command, r.exit_code, r.log_path, r.started_at
+        "SELECT r.id, r.candidate_id, r.command, r.exit_code, r.log_path, r.tail,
+                r.started_at
          FROM run r
          JOIN candidate c ON c.id = r.candidate_id
          WHERE c.repo_path = ?1 AND c.base_branch = ?2
@@ -354,7 +410,8 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         command: row.get(2)?,
         exit_code: row.get(3)?,
         log_path: row.get(4)?,
-        started_at: row.get(5)?,
+        tail: row.get(5)?,
+        started_at: row.get(6)?,
     })
 }
 

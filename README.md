@@ -48,6 +48,7 @@ sasse work --repo . --base main --integration ../integration --db queue.db
 sasse promote 7 --repo . --base main --db queue.db
 sasse dequeue 7 --repo . --base main --db queue.db
 sasse logs 12 --repo . --base main --db queue.db
+sasse prune --repo . --base main --db queue.db --dry-run
 ```
 
 A tick takes the lease, advances the queue by at most one candidate, and gives
@@ -73,9 +74,35 @@ something no longer in the queue. A hand removal is recorded as an eviction
 reading `removed by hand`, so a decision stays distinguishable from a verdict.
 
 `logs` with no argument lists recent gate runs with their verdicts; with a
-candidate it prints that candidate's runs and the tail of the last one. Gate
-logs outlive the queue rows that point at them, so an old one is still readable
-after the queue has moved on.
+candidate it prints that candidate's runs and the tail of the last one.
+
+## Log retention
+
+Gate logs are the only thing in the queue that grows without bound, and how fast
+depends entirely on how chatty the configured gate is. Two settings bound it, and
+`sasse prune` applies the same policy by hand, with `--dry-run` to see what would
+go.
+
+- **`max_log_size` caps one log as it is written.** Past the cap the log keeps its
+  head and its tail and loses the middle, with a marker saying how many bytes
+  went. The head has the gate command's startup output, the tail has the failure,
+  and the middle of a test run is almost always the cases that passed. Without
+  this, one pathological run fills the whole budget by itself.
+- **`log_budget` caps the directory.** A passing candidate's log is removed as
+  soon as it settles, since nobody reads a green gate log, and then the oldest
+  failures go until the directory is under budget. Pruning runs at the start of
+  each tick and never touches a candidate still being assembled or gated.
+
+A failure's last lines are copied onto its run row before its file is removed, so
+the verdict, the command and the actual reason survive indefinitely at about a
+kilobyte each. `sasse logs` shows that tail when the file has gone, labelled as a
+tail rather than presented as a whole log. That is what makes the budget a real
+ceiling rather than a preference: honouring it costs bytes, not explanations.
+
+Measured on a gate printing roughly 330KB per run, an 8KB cap with a 32KB budget
+held at 24750 bytes across three files, where the same eight candidates would
+otherwise have left 2.6MB. The reasoning and the rejected alternatives are in
+[docs/adr/log-retention.md](docs/adr/log-retention.md).
 
 ## Configuration
 
@@ -85,9 +112,12 @@ after the queue has moved on.
 gate = "cargo test --quiet"
 max_batch = 8
 max_attempts = 3
+log_budget = "200MB"
+max_log_size = "2MB"
 ```
 
-Only `gate` is required. There is deliberately no default gate: a worker that
+Only `gate` is required. Sizes may be written as `200MB`, `512KB` or a plain
+number of bytes; suffixes are powers of 1024. There is deliberately no default gate: a worker that
 fell back to a built-in command when the config was missing or malformed would
 be a second route to running something nobody chose.
 
@@ -159,14 +189,18 @@ Early. What exists:
   conflict and a base branch that moved are returned as values, because both are
   verdicts the queue acts on rather than failures.
 - `src/config.rs`, the committed `sasse.toml`.
+- `src/bytes.rs`, sizes written the way people write them.
+- `src/logs.rs`, reading a log's tail and deciding which logs go.
+- `src/retention.rs`, applying that decision to the database and the disk.
 - `src/gate.rs`, running the gate against an assembled candidate, behind a trait.
 - `src/worker.rs`, the tick: lease, assemble, gate, land or bisect, release,
   plus the loop that repeats it.
 - `src/shutdown.rs`, turning a signal into a request to stop between ticks.
 - `src/db.rs`, the migration runner.
 
-Not yet written: anything that prunes old gate logs, and any handling of a
-repository with more than one base branch beyond keeping their queues separate.
+Not yet written: any handling of a repository with more than one base branch
+beyond keeping their queues separate, and any bound on the retained tails
+themselves (about 20MB per ten thousand failures, deliberately left alone).
 
 ## Development
 

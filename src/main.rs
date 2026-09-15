@@ -1,20 +1,19 @@
 use std::cell::Cell;
-use std::collections::VecDeque;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
-use eyre::Result;
+use eyre::{Result, eyre};
 
+use sasse::bytes::ByteSize;
 use sasse::config::{self, Config};
 use sasse::git::{CommandGit, Git, Sha};
+use sasse::logs::{self, Because, Plan};
 use sasse::queue::store::{Amendment, Run, Snapshot, StatusEntry};
 use sasse::queue::{lease, store};
 use sasse::worker::{Progress, TickOutcome, WorkOptions, Worker, work};
-use sasse::{db, gate, shutdown};
+use sasse::{db, gate, retention, shutdown};
 
 #[derive(Parser)]
 #[command(
@@ -125,6 +124,16 @@ enum Command {
         /// Lines of the log to show.
         #[arg(long, default_value = "40")]
         tail: usize,
+    },
+
+    /// Bring the gate logs inside their budget.
+    Prune {
+        #[command(flatten)]
+        target: Target,
+
+        /// Report what would go without removing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Show the queue.
@@ -303,6 +312,32 @@ fn main() -> Result<()> {
             }
         }
 
+        Command::Prune { target, dry_run } => {
+            let conn = db::open(&cli.db)?;
+            let repo = canonical(&target.repo)?;
+            let git = CommandGit::new(&repo, &repo);
+
+            // The budget comes from the base branch tip, like every other
+            // setting: see docs/adr/gate-provenance.md.
+            let tip = git.resolve(&target.base)?;
+            let settings = read_config(&git, &tip)?;
+
+            if dry_run {
+                let plan = retention::dry_run(&conn, &repo, &target.base, settings.log_budget)?;
+                report_plan(&plan, true);
+            } else {
+                let pruned = retention::apply(&conn, &repo, &target.base, settings.log_budget)?;
+                report_plan(&pruned.plan, false);
+                if pruned.tails_kept > 0 {
+                    println!(
+                        "{} failure(s) kept their last {} lines in the queue",
+                        pruned.tails_kept,
+                        logs::RETAINED_TAIL_LINES
+                    );
+                }
+            }
+        }
+
         Command::Status { target, settled } => {
             let conn = db::open(&cli.db)?;
             let repo = canonical(&target.repo)?;
@@ -328,11 +363,60 @@ fn canonical(path: &std::path::Path) -> Result<String> {
     Ok(path.canonicalize()?.to_string_lossy().into_owned())
 }
 
-fn gate_budget(git: &CommandGit, at: &Sha) -> Option<u32> {
-    let source = git.read_file_at(at, config::CONFIG_PATH).ok()??;
+fn read_config(git: &CommandGit, at: &Sha) -> Result<Config> {
+    let source = git.read_file_at(at, config::CONFIG_PATH)?.ok_or_else(|| {
+        eyre!(
+            "{} is missing from {at}, so there are no settings to read",
+            config::CONFIG_PATH
+        )
+    })?;
     Config::parse(&source)
+}
+
+fn gate_budget(git: &CommandGit, at: &Sha) -> Option<u32> {
+    read_config(git, at)
         .ok()
-        .map(|config| config.max_attempts)
+        .map(|settings| settings.max_attempts)
+}
+
+fn report_plan(plan: &Plan, hypothetical: bool) {
+    if plan.is_empty() {
+        println!(
+            "nothing to prune; {} in gate logs, inside the {} budget",
+            ByteSize::new(plan.bytes_before),
+            plan.budget
+        );
+        return;
+    }
+
+    let verb = if hypothetical {
+        "would remove"
+    } else {
+        "removed"
+    };
+    for removal in &plan.remove {
+        let why = match removal.because {
+            Because::NothingToExplain => "passed, nothing to explain",
+            Because::OverBudget => "over budget, oldest failure",
+        };
+        println!(
+            "{verb} candidate {}'s log, {} ({why})",
+            removal.log.candidate_id,
+            ByteSize::new(removal.log.bytes)
+        );
+    }
+    println!(
+        "{} {} {}, leaving {} of a {} budget",
+        ByteSize::new(plan.bytes_freed()),
+        if hypothetical {
+            "would go from"
+        } else {
+            "went from"
+        },
+        ByteSize::new(plan.bytes_before),
+        ByteSize::new(plan.bytes_after),
+        plan.budget
+    );
 }
 
 fn describe(outcome: &TickOutcome) -> String {
@@ -490,16 +574,28 @@ fn print_runs(runs: &[Run]) {
 }
 
 fn print_tail(run: &Run, lines: usize) {
+    println!();
+
     let Some(path) = &run.log_path else {
-        println!();
-        println!("run {} recorded no log", run.id);
+        match &run.tail {
+            // Pruned, but its last lines were kept. Labelled, because a tail
+            // read as a complete log makes the dropped part look like the end
+            // of the run.
+            Some(kept) => {
+                println!("log pruned; these were its last lines:");
+                for line in kept.lines() {
+                    println!("  {line}");
+                }
+            }
+            // A pass keeps no tail, because it has nothing to explain.
+            None => println!("log pruned; nothing kept, because the gate passed"),
+        }
         return;
     };
 
-    println!();
     println!("{path}");
 
-    match tail_of(std::path::Path::new(path), lines) {
+    match logs::tail(std::path::Path::new(path), lines) {
         Err(unreadable) => println!("  (could not be read: {unreadable})"),
         Ok(tail) if tail.is_empty() => println!("  (empty)"),
         Ok(tail) => {
@@ -512,20 +608,6 @@ fn print_tail(run: &Run, lines: usize) {
 
 /// The last `lines` lines, without holding the whole file: a verbose gate can
 /// leave a log far larger than the part anyone wants to read.
-fn tail_of(path: &std::path::Path, lines: usize) -> Result<Vec<String>> {
-    let file = File::open(path)?;
-    let mut kept: VecDeque<String> = VecDeque::with_capacity(lines.saturating_add(1));
-
-    for line in BufReader::new(file).lines() {
-        kept.push_back(line?);
-        if kept.len() > lines {
-            kept.pop_front();
-        }
-    }
-
-    Ok(kept.into())
-}
-
 fn short(sha: &Sha) -> String {
     sha.as_str().chars().take(7).collect()
 }
