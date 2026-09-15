@@ -18,3 +18,16 @@
       from = "proposed"
       to = "accepted"
       at = 2026-09-14T20:22:30.421101Z
+  [decisions.log-retention]
+    file = "log-retention.md"
+    type = "feat"
+    status = "accepted"
+    created = "2026-09-15"
+    author = "thoroc"
+    tags = []
+    description = "Gate logs are bounded by a hard byte budget, with each log capped head-and-tail and its tail kept in the database"
+
+    [[decisions.log-retention.history]]
+      from = "proposed"
+      to = "accepted"
+      at = 2026-09-15T08:29:57.408951Z
