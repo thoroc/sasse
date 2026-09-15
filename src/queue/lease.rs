@@ -15,9 +15,11 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use eyre::{Result, WrapErr, eyre};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
+
+use crate::db::{parse_stamp, stamp};
 
 /// Whether a lease's recorded holder still exists.
 ///
@@ -240,17 +242,6 @@ fn supersede_orphans(
 /// acquisitions.
 fn mint_token(pid: i32, now: DateTime<Utc>) -> String {
     format!("{pid}-{}", now.timestamp_nanos_opt().unwrap_or_default())
-}
-
-/// Fixed-width UTC, so the text column orders the same way the instants do.
-fn stamp(t: DateTime<Utc>) -> String {
-    t.to_rfc3339_opts(SecondsFormat::Micros, true)
-}
-
-fn parse_stamp(s: &str) -> Result<DateTime<Utc>> {
-    Ok(DateTime::parse_from_rfc3339(s)
-        .wrap_err_with(|| format!("parsing the lease timestamp {s:?}"))?
-        .with_timezone(&Utc))
 }
 
 #[cfg(unix)]

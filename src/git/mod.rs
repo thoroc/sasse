@@ -15,6 +15,8 @@ use eyre::{Result, eyre};
 
 pub mod command;
 
+pub use command::CommandGit;
+
 #[cfg(test)]
 pub mod fake;
 
@@ -92,6 +94,15 @@ pub trait Git {
     /// Move a branch from one commit to another, atomically, failing if it is
     /// not currently at `from`.
     fn fast_forward(&self, refname: &str, from: &Sha, to: &Sha) -> Result<RefUpdate>;
+
+    /// Read a file as it exists in a commit, or `None` if the commit has no
+    /// such path.
+    ///
+    /// Out of the commit, deliberately, never off a working tree: the gate
+    /// command is read this way, and reading it from disk would let whatever a
+    /// candidate leaves in the integration checkout decide what the worker
+    /// runs.
+    fn read_file_at(&self, at: &Sha, path: &str) -> Result<Option<String>>;
 }
 
 /// Checkouts that currently have `refname` checked out. Empty means the ref is

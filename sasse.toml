@@ -1,0 +1,11 @@
+# sasse gates itself with this. Read from the base branch tip, never from the
+# candidate under test: see docs/adr/gate-provenance.md.
+gate = "cargo test --quiet"
+
+# Most entries in one candidate. Larger lands more per gate run when everything
+# is green, and costs more bisection rounds when it is not.
+max_batch = 8
+
+# How many times an entry may be the culprit of a failed candidate before it is
+# evicted from the queue.
+max_attempts = 3

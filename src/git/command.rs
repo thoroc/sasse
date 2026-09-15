@@ -123,11 +123,31 @@ impl Git for CommandGit {
         ))
     }
 
+    fn read_file_at(&self, at: &Sha, path: &str) -> Result<Option<String>> {
+        let out = self.run(&self.repo, &["show", &format!("{at}:{path}")])?;
+        if out.status.success() {
+            return Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()));
+        }
+        // A path absent from the commit is an ordinary answer, not a fault. Any
+        // other failure is worth raising.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("does not exist") || stderr.contains("exists on disk, but not in") {
+            return Ok(None);
+        }
+        Err(eyre!("reading {path} at {at} failed: {}", stderr.trim()))
+    }
+
     fn fast_forward(&self, refname: &str, from: &Sha, to: &Sha) -> Result<RefUpdate> {
+        // update-ref takes the ref name literally and will not apply the usual
+        // resolution rules, so "main" has to be spelled out. rev-parse, used by
+        // resolve, accepts either, which is why a short name reads correctly and
+        // then fails to write.
+        let qualified = qualify(refname);
+
         // update-ref with an expected old value is the atomic compare-and-set.
         let out = self.run(
             &self.repo,
-            &["update-ref", refname, to.as_str(), from.as_str()],
+            &["update-ref", &qualified, to.as_str(), from.as_str()],
         )?;
 
         if out.status.success() {
@@ -143,6 +163,16 @@ impl Git for CommandGit {
                 String::from_utf8_lossy(&out.stderr).trim()
             )),
         }
+    }
+}
+
+/// Spell a branch name out as a full ref, leaving an already-qualified name
+/// alone.
+fn qualify(refname: &str) -> String {
+    if refname.starts_with("refs/") {
+        refname.to_string()
+    } else {
+        format!("refs/heads/{refname}")
     }
 }
 
@@ -361,6 +391,30 @@ mod tests {
             f.git.resolve("refs/heads/main").unwrap(),
             f.conflicting,
             "a stale update must change nothing"
+        );
+    }
+
+    /// `git update-ref` does not resolve short names, so this asserts against
+    /// real git. The in-memory fake normalises ref spellings and is therefore
+    /// structurally unable to catch it.
+    #[test]
+    fn a_short_branch_name_can_still_be_moved() {
+        let f = fixture();
+        assert_eq!(
+            f.git.fast_forward("main", &f.base, &f.clean).unwrap(),
+            RefUpdate::Updated
+        );
+        assert_eq!(f.git.resolve("main").unwrap(), f.clean);
+    }
+
+    #[test]
+    fn a_short_and_a_fully_qualified_name_move_the_same_branch() {
+        let f = fixture();
+        f.git.fast_forward("main", &f.base, &f.clean).unwrap();
+        assert_eq!(
+            f.git.resolve("refs/heads/main").unwrap(),
+            f.clean,
+            "the short name must address the same ref as the long one"
         );
     }
 

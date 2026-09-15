@@ -37,6 +37,40 @@ not finish sooner, they just contend. So sasse batches instead:
 Common case is one gate run for the whole batch. Failure costs `log2(N)`
 additional rounds, and only when something is actually broken.
 
+## Usage
+
+```sh
+sasse migrate --db queue.db
+sasse enqueue feat/my-branch --repo . --base main --db queue.db
+sasse tick --repo . --base main --integration ../integration --db queue.db
+```
+
+A tick takes the lease, advances the queue by at most one candidate, and gives
+the lease back. `sasse work`, a loop around it, is not written yet; until then
+drive `tick` from launchd, a git hook, or by hand.
+
+## Configuration
+
+`sasse.toml`, committed to the repository:
+
+```toml
+gate = "cargo test --quiet"
+max_batch = 8
+max_attempts = 3
+```
+
+Only `gate` is required. There is deliberately no default gate: a worker that
+fell back to a built-in command when the config was missing or malformed would
+be a second route to running something nobody chose.
+
+The gate is read from the **base branch tip**, not from the candidate being
+gated, so a queued branch cannot choose the command that runs on your machine.
+One consequence is worth knowing before it surprises you: a change to
+`sasse.toml` takes effect one merge *after* it lands, so a gate change wants its
+own merge rather than riding along with the code that depends on it. The
+reasoning and the rejected alternatives are in
+[docs/adr/gate-provenance.md](docs/adr/gate-provenance.md).
+
 ## Repository layout
 
 The queue requires that **the base branch is checked out nowhere**. The
@@ -63,6 +97,10 @@ this, so sasse refuses to move a base branch that any checkout holds.
    Only the entry isolated as the culprit spends an attempt. An entry skipped
    because a batch-mate failed requeues for free, so one flaky branch cannot
    drain the budget of everything batched alongside it.
+   An entry being retried is also never batched with an entry that has never
+   failed. It has already demonstrated that it fails on its own, so batching it
+   again would cost every innocent entry beside it a wasted gate run and a trip
+   through bisection, repeatedly, until its budget finally ran out.
 5. Queue state is persisted. A reboot mid-batch must not lose the queue.
 6. Exactly one worker integrates into a base branch at a time, held as a lease
    with an expiry. Expiry is the authority, so a worker that wedges or dies
@@ -89,10 +127,13 @@ Early. What exists:
   implementation over the `git` command and an in-memory fake for tests. A merge
   conflict and a base branch that moved are returned as values, because both are
   verdicts the queue acts on rather than failures.
+- `src/config.rs`, the committed `sasse.toml`.
+- `src/gate.rs`, running the gate against an assembled candidate, behind a trait.
+- `src/worker.rs`, the tick: lease, assemble, gate, land or bisect, release.
 - `src/db.rs`, the migration runner.
 
-Not yet written: the worker loop, the gate runner, and the CLI beyond
-`sasse migrate`.
+Not yet written: `sasse work` (the loop around `tick`), and any way to inspect
+the queue from the command line.
 
 ## Development
 

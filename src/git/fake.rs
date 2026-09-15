@@ -26,6 +26,11 @@ struct State {
     /// Counter behind the synthesised candidate ids, so a test can predict
     /// them.
     minted: u32,
+    /// File contents keyed by the commit they live in.
+    blobs: HashMap<(Sha, String), String>,
+    /// File contents present in every commit, unless `blobs` overrides them for
+    /// a specific one. Models a file that has simply always been in the repo.
+    ubiquitous: HashMap<String, String>,
 }
 
 impl FakeGit {
@@ -37,6 +42,8 @@ impl FakeGit {
                 head: None,
                 conflicting: HashSet::new(),
                 minted: 0,
+                blobs: HashMap::new(),
+                ubiquitous: HashMap::new(),
             }),
         }
     }
@@ -60,6 +67,26 @@ impl FakeGit {
             path: PathBuf::from(path),
             branch: branch.map(|b| b.to_string()),
         });
+        self
+    }
+
+    /// Put a file into a commit.
+    pub fn with_file(self, at: &Sha, path: &str, contents: &str) -> Self {
+        self.state
+            .lock()
+            .unwrap()
+            .blobs
+            .insert((at.clone(), path.to_string()), contents.to_string());
+        self
+    }
+
+    /// Put a file into every commit, present and future.
+    pub fn with_file_everywhere(self, path: &str, contents: &str) -> Self {
+        self.state
+            .lock()
+            .unwrap()
+            .ubiquitous
+            .insert(path.to_string(), contents.to_string());
         self
     }
 
@@ -122,6 +149,15 @@ impl Git for FakeGit {
             .expect("a synthesised id is 40 hex digits");
         state.head = Some(merged.clone());
         Ok(MergeOutcome::Merged(merged))
+    }
+
+    fn read_file_at(&self, at: &Sha, path: &str) -> Result<Option<String>> {
+        let state = self.state.lock().unwrap();
+        Ok(state
+            .blobs
+            .get(&(at.clone(), path.to_string()))
+            .or_else(|| state.ubiquitous.get(path))
+            .cloned())
     }
 
     fn fast_forward(&self, refname: &str, from: &Sha, to: &Sha) -> Result<RefUpdate> {

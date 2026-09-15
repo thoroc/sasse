@@ -1,12 +1,17 @@
 use std::path::Path;
 use std::time::Duration;
 
-use eyre::{Result, WrapErr};
+use chrono::{DateTime, SecondsFormat, Utc};
+use eyre::{Result, WrapErr, eyre};
 use rusqlite::Connection;
 
 const MIGRATIONS: &[(i32, &str)] = &[
     (1, include_str!("../migrations/0001_init.sql")),
     (2, include_str!("../migrations/0002_worker_lease.sql")),
+    (
+        3,
+        include_str!("../migrations/0003_candidate_without_a_commit.sql"),
+    ),
 ];
 
 pub fn open(path: &Path) -> Result<Connection> {
@@ -35,18 +40,64 @@ fn configure(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Fixed-width UTC, so a text timestamp column orders the same way the instants
+/// do and can be compared with plain SQL inequalities.
+pub fn stamp(at: DateTime<Utc>) -> String {
+    at.to_rfc3339_opts(SecondsFormat::Micros, true)
+}
+
+pub fn now_stamp() -> String {
+    stamp(Utc::now())
+}
+
+pub fn parse_stamp(raw: &str) -> Result<DateTime<Utc>> {
+    Ok(DateTime::parse_from_rfc3339(raw)
+        .wrap_err_with(|| format!("parsing the timestamp {raw:?}"))?
+        .with_timezone(&Utc))
+}
+
 fn migrate(conn: &Connection) -> Result<()> {
     let current: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if MIGRATIONS.iter().all(|(version, _)| *version <= current) {
+        return Ok(());
+    }
+
+    // A migration that changes a CHECK constraint has to rebuild the table,
+    // which means dropping one that other tables reference. SQLite's documented
+    // procedure for that is to disable foreign key enforcement, do the work in a
+    // transaction, and verify referential integrity before committing. The
+    // pragma is a no-op inside a transaction, so it is toggled out here.
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let applied = apply_pending(conn, current);
+    conn.pragma_update(None, "foreign_keys", true)?;
+    applied
+}
+
+fn apply_pending(conn: &Connection, current: i32) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+
     for (version, sql) in MIGRATIONS {
         if *version <= current {
             continue;
         }
-        let tx = conn.unchecked_transaction()?;
         tx.execute_batch(sql)
             .wrap_err_with(|| format!("applying migration {version}"))?;
         tx.pragma_update(None, "user_version", version)?;
-        tx.commit()?;
     }
+
+    // Foreign keys were unenforced while the above ran, so check the result
+    // rather than trusting it.
+    let violations: i64 =
+        tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })?;
+    if violations > 0 {
+        return Err(eyre!(
+            "migrating left {violations} row(s) with a dangling reference; rolled back"
+        ));
+    }
+
+    tx.commit()?;
     Ok(())
 }
 
@@ -197,5 +248,77 @@ mod tests {
             )
             .unwrap_or_else(|e| panic!("schema rejected outcome {outcome}: {e}"));
         }
+    }
+
+    /// Relaxed by migration 0003: a batch containing a branch that conflicts
+    /// with the base never produces a commit, and is still genuinely failed.
+    #[test]
+    fn a_candidate_that_never_assembled_may_have_no_commit() {
+        let conn = open_in_memory().unwrap();
+        conn.execute(
+            "INSERT INTO candidate (repo_path, base_branch, base_sha, candidate_sha, state, created_at, updated_at)
+             VALUES ('/repo', 'main', 'base', NULL, 'failed', '', '')",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// Still enforced: these are the states in which a commit was gated or
+    /// landed, so the commit has to be named.
+    #[test]
+    fn a_gated_or_landed_candidate_must_still_name_its_commit() {
+        let conn = open_in_memory().unwrap();
+        for state in ["testing", "passed"] {
+            let attempt = conn.execute(
+                "INSERT INTO candidate (repo_path, base_branch, base_sha, candidate_sha, state, created_at, updated_at)
+                 VALUES ('/repo', 'main', 'base', NULL, ?1, '', '')",
+                [state],
+            );
+            assert!(attempt.is_err(), "{state} must name its commit");
+        }
+    }
+
+    /// The rebuild in migration 0003 drops a table other tables reference, so
+    /// check that those references still work afterwards.
+    #[test]
+    fn references_to_candidate_survive_the_rebuild() {
+        let conn = open_in_memory().unwrap();
+        let candidate_id = seed_candidate(&conn);
+        let entry_id = seed_entry(&conn, "abc");
+
+        conn.execute(
+            "INSERT INTO candidate_entry (candidate_id, entry_id, position) VALUES (?1, ?2, 0)",
+            (candidate_id, entry_id),
+        )
+        .unwrap();
+
+        let dangling = conn.execute(
+            "INSERT INTO run (candidate_id, command, started_at) VALUES (?1, 'x', '')",
+            [candidate_id + 9999],
+        );
+        assert!(
+            dangling.is_err(),
+            "the foreign key must still be enforced after the rebuild"
+        );
+    }
+
+    #[test]
+    fn the_rebuild_keeps_the_active_candidate_index_usable() {
+        let conn = open_in_memory().unwrap();
+        seed_candidate(&conn);
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT id FROM candidate
+                 WHERE repo_path = '/repo' AND base_branch = 'main'
+                   AND state IN ('building', 'testing')",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("candidate_active"),
+            "the partial index should still be used: {plan}"
+        );
     }
 }
