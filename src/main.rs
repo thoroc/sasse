@@ -136,10 +136,17 @@ enum Command {
         dry_run: bool,
     },
 
-    /// Show the queue.
+    /// Show the queue, or every queue in the repository.
     Status {
-        #[command(flatten)]
-        target: Target,
+        /// The repository whose queues are shown.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+
+        /// One base branch, shown in full. Omit to list every branch that has a
+        /// queue. Deliberately without a default, unlike every other command:
+        /// here its absence means something.
+        #[arg(long)]
+        base: Option<String>,
 
         /// How many settled entries to list.
         #[arg(long, default_value = "5")]
@@ -338,19 +345,31 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Status { target, settled } => {
+        Command::Status {
+            repo,
+            base,
+            settled,
+        } => {
             let conn = db::open(&cli.db)?;
-            let repo = canonical(&target.repo)?;
+            let repo = canonical(&repo)?;
             let git = CommandGit::new(&repo, &repo);
 
-            let snapshot = store::snapshot(&conn, &repo, &target.base, settled)?;
-            let held = lease::current(&conn, &repo, &target.base)?;
-            let tip = git.resolve(&target.base).ok();
-            // The retry budget makes an attempt count meaningful, but status
-            // should still work when the config cannot be read.
-            let budget = tip.as_ref().and_then(|at| gate_budget(&git, at));
+            match base {
+                Some(base) => {
+                    let snapshot = store::snapshot(&conn, &repo, &base, settled)?;
+                    let held = lease::current(&conn, &repo, &base)?;
+                    let tip = git.resolve(&base).ok();
+                    // The retry budget makes an attempt count meaningful, but
+                    // status should still work when the config cannot be read.
+                    let budget = tip.as_ref().and_then(|at| gate_budget(&git, at));
 
-            print_status(&repo, &target.base, tip.as_ref(), held, budget, &snapshot);
+                    print_status(&repo, &base, tip.as_ref(), held, budget, &snapshot);
+                }
+                None => {
+                    let summaries = store::branch_summaries(&conn, &repo)?;
+                    print_overview(&repo, &git, &conn, &summaries)?;
+                }
+            }
         }
     }
 
@@ -468,6 +487,75 @@ fn describe(outcome: &TickOutcome) -> String {
             retrying,
         } => format!("candidate {failed} failed; bisecting into candidate {next} of {retrying}"),
     }
+}
+
+/// Every base branch with a queue, one line each.
+///
+/// A summary rather than the detail repeated: a full entry listing per branch
+/// makes the common case unreadable, and `--base` is right there for detail.
+fn print_overview(
+    repo: &str,
+    git: &CommandGit,
+    conn: &rusqlite::Connection,
+    summaries: &[store::BranchSummary],
+) -> Result<()> {
+    println!("repo    {repo}");
+
+    if summaries.is_empty() {
+        println!();
+        println!("no queues here yet; `sasse enqueue <branch> --base <branch>` starts one");
+        return Ok(());
+    }
+
+    println!();
+    println!(
+        "{:<24} {:<11} {:<20} {:<10} {:>6} {:>7} {:>7}",
+        "branch", "tip", "worker", "candidate", "queued", "batched", "settled"
+    );
+
+    for summary in summaries {
+        // A branch whose ref has gone still has queue history, and showing it is
+        // the point of this command, so an unresolvable tip is reported rather
+        // than failing the listing.
+        let tip = match git.resolve(&summary.base_branch) {
+            Ok(at) => short(&at),
+            Err(_) => "unresolved".to_string(),
+        };
+
+        let worker = match lease::current(conn, repo, &summary.base_branch)? {
+            None => "none".to_string(),
+            Some(held) => {
+                let note = if held.expired {
+                    " expired"
+                } else if !held.holder_present {
+                    " gone"
+                } else {
+                    ""
+                };
+                format!("pid {}{note}", held.holder_pid)
+            }
+        };
+
+        let candidate = summary
+            .active_candidate
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "-".to_string());
+
+        println!(
+            "{:<24} {:<11} {:<20} {:<10} {:>6} {:>7} {:>7}",
+            summary.base_branch,
+            tip,
+            worker,
+            candidate,
+            summary.queued,
+            summary.batched,
+            summary.settled
+        );
+    }
+
+    println!();
+    println!("sasse status --base <branch> for one queue in full");
+    Ok(())
 }
 
 fn print_status(

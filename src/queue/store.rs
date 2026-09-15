@@ -4,6 +4,8 @@
 //! decision table rather than as SQL. State changes that must not be seen
 //! half-applied are wrapped in a transaction here rather than at the call site.
 
+use std::collections::BTreeMap;
+
 use eyre::{Result, WrapErr, eyre};
 use rusqlite::{Connection, OptionalExtension};
 
@@ -415,8 +417,101 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     })
 }
 
+/// One base branch's queue at a glance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchSummary {
+    pub base_branch: String,
+    pub queued: usize,
+    pub batched: usize,
+    /// Merged or evicted.
+    pub settled: usize,
+    pub active_candidate: Option<i64>,
+}
+
+/// Every base branch this repository has a queue for.
+///
+/// Drawn from entries, candidates and leases together rather than from entries
+/// alone: a branch whose entries have all settled still has history and may
+/// still hold a lease, and a command whose purpose is to show what exists should
+/// not hide it the moment its queue drains.
+pub fn base_branches(conn: &Connection, repo_path: &str) -> Result<Vec<String>> {
+    let mut statement = conn.prepare(
+        "SELECT base_branch FROM entry WHERE repo_path = ?1
+         UNION
+         SELECT base_branch FROM candidate WHERE repo_path = ?1
+         UNION
+         SELECT base_branch FROM worker_lease WHERE repo_path = ?1
+         ORDER BY base_branch",
+    )?;
+    let rows = statement.query_map([repo_path], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// A summary per base branch, for the overview `status` shows without `--base`.
+pub fn branch_summaries(conn: &Connection, repo_path: &str) -> Result<Vec<BranchSummary>> {
+    let mut summaries: BTreeMap<String, BranchSummary> = base_branches(conn, repo_path)?
+        .into_iter()
+        .map(|base_branch| {
+            (
+                base_branch.clone(),
+                BranchSummary {
+                    base_branch,
+                    queued: 0,
+                    batched: 0,
+                    settled: 0,
+                    active_candidate: None,
+                },
+            )
+        })
+        .collect();
+
+    let mut counts = conn.prepare(
+        "SELECT base_branch, state, count(*)
+         FROM entry WHERE repo_path = ?1
+         GROUP BY base_branch, state",
+    )?;
+    let rows = counts.query_map([repo_path], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, usize>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (base_branch, state, how_many) = row?;
+        let Some(summary) = summaries.get_mut(&base_branch) else {
+            continue;
+        };
+        match EntryState::parse(&state)? {
+            EntryState::Queued => summary.queued += how_many,
+            EntryState::Batched => summary.batched += how_many,
+            EntryState::Merged | EntryState::Evicted => summary.settled += how_many,
+        }
+    }
+
+    let mut active = conn.prepare(
+        "SELECT base_branch, id
+         FROM candidate
+         WHERE repo_path = ?1 AND state IN ('building', 'testing')
+         ORDER BY id ASC",
+    )?;
+    let rows = active.query_map([repo_path], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    for row in rows {
+        let (base_branch, candidate) = row?;
+        if let Some(summary) = summaries.get_mut(&base_branch) {
+            summary.active_candidate.get_or_insert(candidate);
+        }
+    }
+
+    Ok(summaries.into_values().collect())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::db;
 
@@ -658,6 +753,156 @@ mod tests {
     fn runs_from_another_base_branch_are_not_listed() {
         let conn = db::open_in_memory().unwrap();
         assert!(recent_runs(&conn, REPO, "release", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_repository_with_no_queues_has_no_base_branches() {
+        let conn = db::open_in_memory().unwrap();
+        assert!(base_branches(&conn, REPO).unwrap().is_empty());
+        assert!(branch_summaries(&conn, REPO).unwrap().is_empty());
+    }
+
+    #[test]
+    fn every_branch_with_a_queue_is_listed_in_order() {
+        let conn = db::open_in_memory().unwrap();
+        queue(&conn, "feat/a", 1, 0);
+        enqueue(&conn, REPO, "release", "feat/b", &sha(2)).unwrap();
+
+        assert_eq!(
+            base_branches(&conn, REPO).unwrap(),
+            vec!["main".to_string(), "release".to_string()]
+        );
+    }
+
+    /// A branch whose queue has drained still exists, and a command for showing
+    /// what exists should not hide it.
+    #[test]
+    fn a_branch_whose_entries_have_all_settled_is_still_listed() {
+        let conn = db::open_in_memory().unwrap();
+        let id = queue(&conn, "feat/done", 1, 0);
+        conn.execute("UPDATE entry SET state = 'merged' WHERE id = ?1", [id])
+            .unwrap();
+
+        let summaries = branch_summaries(&conn, REPO).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].base_branch, "main");
+        assert_eq!(summaries[0].queued, 0);
+        assert_eq!(summaries[0].settled, 1);
+    }
+
+    /// Entries are not the only record of a branch: a lease alone is enough.
+    #[test]
+    fn a_branch_known_only_to_a_lease_is_listed() {
+        let mut conn = db::open_in_memory().unwrap();
+        crate::queue::lease::acquire(&mut conn, REPO, "release", Duration::from_secs(60)).unwrap();
+
+        assert_eq!(
+            base_branches(&conn, REPO).unwrap(),
+            vec!["release".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_branch_known_only_to_a_candidate_is_listed() {
+        let mut conn = db::open_in_memory().unwrap();
+        let id = enqueue(&conn, REPO, "release", "feat/x", &sha(1)).unwrap();
+        let entry = Entry {
+            id,
+            branch: "feat/x".into(),
+            branch_sha: sha(1),
+            attempts: 0,
+        };
+        open_candidate(
+            &mut conn,
+            REPO,
+            "release",
+            &sha(200),
+            std::slice::from_ref(&entry),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            base_branches(&conn, REPO).unwrap(),
+            vec!["release".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_summary_counts_each_state_and_names_the_candidate_in_flight() {
+        let mut conn = db::open_in_memory().unwrap();
+        let waiting = queue(&conn, "feat/waiting", 1, 0);
+        let inside = queue(&conn, "feat/inside", 2, 0);
+        let gone = queue(&conn, "feat/gone", 3, 0);
+
+        let entry = Entry {
+            id: inside,
+            branch: "feat/inside".into(),
+            branch_sha: sha(2),
+            attempts: 0,
+        };
+        let candidate = open_candidate(
+            &mut conn,
+            REPO,
+            BASE,
+            &sha(200),
+            std::slice::from_ref(&entry),
+            None,
+        )
+        .unwrap();
+        conn.execute("UPDATE entry SET state = 'evicted' WHERE id = ?1", [gone])
+            .unwrap();
+
+        let summaries = branch_summaries(&conn, REPO).unwrap();
+        assert_eq!(summaries.len(), 1);
+        let main = &summaries[0];
+        assert_eq!(main.queued, 1, "only {waiting} is waiting");
+        assert_eq!(main.batched, 1);
+        assert_eq!(main.settled, 1);
+        assert_eq!(main.active_candidate, Some(candidate));
+    }
+
+    #[test]
+    fn a_branch_with_no_candidate_in_flight_reports_none() {
+        let conn = db::open_in_memory().unwrap();
+        queue(&conn, "feat/a", 1, 0);
+
+        assert_eq!(
+            branch_summaries(&conn, REPO).unwrap()[0].active_candidate,
+            None
+        );
+    }
+
+    /// The database can hold several repositories; the overview is scoped to one.
+    #[test]
+    fn branches_belonging_to_another_repository_are_not_listed() {
+        let conn = db::open_in_memory().unwrap();
+        queue(&conn, "feat/a", 1, 0);
+        enqueue(&conn, "/elsewhere", "trunk", "feat/b", &sha(9)).unwrap();
+
+        assert_eq!(
+            base_branches(&conn, REPO).unwrap(),
+            vec!["main".to_string()]
+        );
+        assert_eq!(
+            base_branches(&conn, "/elsewhere").unwrap(),
+            vec!["trunk".to_string()]
+        );
+    }
+
+    #[test]
+    fn summaries_cover_every_branch_separately() {
+        let conn = db::open_in_memory().unwrap();
+        queue(&conn, "feat/a", 1, 0);
+        queue(&conn, "feat/b", 2, 0);
+        enqueue(&conn, REPO, "release", "feat/c", &sha(3)).unwrap();
+
+        let summaries = branch_summaries(&conn, REPO).unwrap();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].base_branch, "main");
+        assert_eq!(summaries[0].queued, 2);
+        assert_eq!(summaries[1].base_branch, "release");
+        assert_eq!(summaries[1].queued, 1);
     }
 
     #[test]

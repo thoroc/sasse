@@ -42,7 +42,8 @@ additional rounds, and only when something is actually broken.
 ```sh
 sasse migrate --db queue.db
 sasse enqueue feat/my-branch --repo . --base main --db queue.db
-sasse status --repo . --base main --db queue.db
+sasse status --repo . --db queue.db              # every branch with a queue
+sasse status --repo . --base main --db queue.db  # one queue, in full
 sasse tick --repo . --base main --integration ../integration --db queue.db
 sasse work --repo . --base main --integration ../integration --db queue.db
 sasse promote 7 --repo . --base main --db queue.db
@@ -63,9 +64,24 @@ well as the worker, so the gate exits non-zero, but that is recorded as an
 interruption rather than as a verdict: the candidate is discarded, its entries
 are requeued, and nobody's retry budget is charged.
 
-`status` reads the queue and changes nothing. It shows the base tip, who holds
-the lease and for how long, the candidate in flight, what is waiting, and what
-recently merged or was evicted and why.
+`status` reads the queue and changes nothing. With `--base` it shows that
+queue's base tip, who holds the lease and for how long, the candidate in flight,
+what is waiting, and what recently merged or was evicted and why. Without
+`--base` it lists every base branch in the repository that has a queue, one line
+each, discovered from the database rather than from configuration.
+
+A branch stays listed once its queue drains, and one whose ref has since been
+deleted is shown with an unresolved tip rather than failing the command: a branch
+that is gone but still has queue history is exactly what you would be running
+this to find.
+
+Queues on different base branches are fully independent. The worker lease is
+held per repository and base branch, so a worker on `main` does not exclude one
+on `release`, which is asserted by a test rather than assumed. Serving two
+branches is therefore two `sasse work` processes, deliberately: a single worker
+covering several branches would reimplement inside one process an exclusion the
+lease already provides between them. The reasoning is in
+[docs/adr/base-branch-overview.md](docs/adr/base-branch-overview.md).
 
 `promote` moves a waiting entry to the front, and `dequeue` takes one out.
 Neither will touch an entry that is inside a candidate: it is mid-gate, and
@@ -198,9 +214,9 @@ Early. What exists:
 - `src/shutdown.rs`, turning a signal into a request to stop between ticks.
 - `src/db.rs`, the migration runner.
 
-Not yet written: any handling of a repository with more than one base branch
-beyond keeping their queues separate, and any bound on the retained tails
-themselves (about 20MB per ten thousand failures, deliberately left alone).
+Not yet written: any bound on the retained log tails themselves, about 20MB per
+ten thousand failures, deliberately left alone as three orders of magnitude
+below the log budget they protect.
 
 ## Development
 
