@@ -5,6 +5,19 @@
   default_base = "main"
 
 [decisions]
+  [decisions.base-branch-overview]
+    file = "base-branch-overview.md"
+    type = "feat"
+    status = "accepted"
+    created = "2026-09-15"
+    author = "thoroc"
+    tags = []
+    description = "status lists every base branch with a queue when --base is omitted; driving stays one worker per branch"
+
+    [[decisions.base-branch-overview.history]]
+      from = "proposed"
+      to = "accepted"
+      at = 2026-09-15T09:54:51.863621Z
   [decisions.gate-provenance]
     file = "gate-provenance.md"
     type = "feat"
