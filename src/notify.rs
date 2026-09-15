@@ -349,27 +349,50 @@ mod tests {
         );
     }
 
-    /// The timing assertions above would still pass if a descendant survived
-    /// and merely stopped holding the pipe. This asserts the operational
+    #[cfg(unix)]
+    fn alive(pid: i32) -> bool {
+        // SAFETY: signal 0 runs the existence check without delivering anything.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// The timing assertions above would still pass if a descendant survived and
+    /// merely stopped holding the pipe. This asserts the operational
     /// consequence: nothing the hook started outlives the kill.
+    ///
+    /// The child's pid is checked directly rather than waiting for a marker file
+    /// that a surviving child would eventually write. An earlier version did the
+    /// latter and was a race between the kill and the clock: under parallel test
+    /// load the poll loop can be descheduled past the sleep it was betting
+    /// against, and the test failed for reasons that had nothing to do with the
+    /// behaviour.
     #[test]
     fn a_timed_out_hook_leaves_no_descendant_behind() {
         let dir = tempfile::tempdir().unwrap();
-        let notifier = ShellNotifier::new(dir.path()).with_timeout(Duration::from_millis(100));
+        let notifier = ShellNotifier::new(dir.path()).with_timeout(Duration::from_millis(500));
 
-        // Backgrounded, so the shell forks. The marker only appears if the
-        // child is still alive a second after the deadline.
-        notifier.settled(
-            "(sleep 1; touch survived) & wait",
+        // Backgrounded, so the shell forks, and the pid is recorded at once.
+        let delivery = notifier.settled(
+            "sleep 30 & echo $! > child.pid; wait",
             &merged(),
             "/repo",
             "main",
         );
+        assert_eq!(delivery, Delivery::TimedOut);
 
-        std::thread::sleep(Duration::from_millis(1800));
+        let recorded = std::fs::read_to_string(dir.path().join("child.pid"))
+            .expect("the hook should record its child's pid long before the deadline");
+        let child: i32 = recorded.trim().parse().expect("a pid");
+
+        // A killed process is briefly a zombie until whatever inherits it reaps
+        // it, so allow for that rather than asserting on the first observation.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while alive(child) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
         assert!(
-            !dir.path().join("survived").exists(),
-            "a descendant outlived the group kill and kept running"
+            !alive(child),
+            "pid {child} was still alive three seconds after the group kill"
         );
     }
 
