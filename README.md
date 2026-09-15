@@ -138,7 +138,8 @@ reasoning and the rejected alternatives are in
 Gate logs are the only thing in the queue that grows without bound, and how fast
 depends entirely on how chatty the configured gate is. Two settings bound it, and
 `sasse prune` applies the same policy by hand, with `--dry-run` to see what would
-go.
+go. They are written under `--logs`, `sasse-logs` by default, and outlive the
+queue rows that point at them.
 
 - **`max_log_size` caps one log as it is written.** Past the cap the log keeps its
   head and its tail and loses the middle, with a marker saying how many bytes
@@ -175,8 +176,9 @@ on_settle = "terminal-notifier -message \"$SASSE_BRANCH $SASSE_OUTCOME\""
 ```
 
 Only `gate` is required. Sizes may be written as `200MB`, `512KB` or a plain
-number of bytes; suffixes are powers of 1024. There is deliberately no default gate: a worker that
-fell back to a built-in command when the config was missing or malformed would
+number of bytes; suffixes are powers of 1024. There is deliberately no default
+gate: a worker that fell back to a built-in command when the config was missing
+or malformed would
 be a second route to running something nobody chose.
 
 The gate is read from the **base branch tip**, not from the candidate being
@@ -234,7 +236,9 @@ a state the worker will later trust.
 
 Early. What exists:
 
-- `migrations/0001_init.sql`, the queue schema.
+- `migrations/`, the queue schema, added to and never edited: the initial
+  tables, the worker lease, a relaxed rule about when a candidate must name a
+  commit, and the retained tail of a pruned log.
 - `src/queue/state.rs`, the entry and candidate state machines.
 - `src/queue/outcome.rs`, the per-candidate verdict for an entry, which decides
   whether a failure spends part of that entry's retry budget.
@@ -242,7 +246,9 @@ Early. What exists:
 - `src/queue/lease.rs`, the single-worker lease: acquire or attach, renew
   against a fencing token, and reclaim a dead holder's lease along with the
   candidate it abandoned.
-- `src/git.rs` and `src/git/`, the git operations behind a trait, with a real
+- `src/queue/store.rs`, every read and write of the queue rows, so the worker
+  reads as a decision table rather than as SQL.
+- `src/git/`, the git operations behind a trait, with a real
   implementation over the `git` command and an in-memory fake for tests. A merge
   conflict and a base branch that moved are returned as values, because both are
   verdicts the queue acts on rather than failures.
@@ -271,14 +277,18 @@ mise run fix             # and fix what can be fixed
 mise run test
 ```
 
+Everything lands on `main` through a pull request, and `ci` is the only required
+check. The branch loop, the merge settings, and the commit, ADR and migration
+conventions are in [CONTRIBUTING.md](CONTRIBUTING.md).
+
 Linters are declared once, in `hk.pkl`, and every route runs that same set: the
 pre-commit hook, `mise run check`, and CI. A check that only CI knows how to run
 is a check people discover by having it fail.
 
 `hk install` wires two hooks. Pre-commit fixes and checks the files being
 committed. Pre-push adds the test suite, which is deliberately not in
-pre-commit: a full suite on every commit is a hook people turn off, and with no
-remote in play, pre-push is the last gate before `main`.
+pre-commit: a full suite on every commit is a hook people turn off. Neither hook
+is a substitute for CI: a local pass is not a CI pass.
 
 To run the pre-push hook by hand, close its stdin: `hk run pre-push
 </dev/null`. A pre-push hook receives the refs being pushed on stdin, so
@@ -296,13 +306,14 @@ Tool versions are pinned in `mise.toml` and locked in `mise.lock`, and CI
 installs them through mise rather than using whatever the runner image ships, so
 a linter cannot pass locally and fail in CI over a version difference.
 
-`.github/workflows/ci.yml` runs `mise run check` and `mise run test`, checks that
-no tool version changed without `mise.lock` being committed, and drives the built
-binary against a throwaway repository, because the unit tests use fakes for git and for the gate and
-several real bugs here were only reachable without them. Every action is pinned
-to a full commit SHA, and `zizmor.yml` lints the workflows themselves. Note that
-this repository has no remote, so those workflows do not run anywhere yet; `mise
-run ci` is the thing that runs today.
+`.github/workflows/ci.yml` runs on every pull request and on every push to
+`main`. It runs `mise run check` and `mise run test`, checks the migrations are
+append-only against the pull request's base, checks that no tool version changed
+without `mise.lock` being committed, and drives the built binary against a
+throwaway repository, because the unit tests use fakes for git and for the gate
+and several real bugs here were only reachable without them. One `ci` job gathers
+the rest, so requiring that single check requires all of them. Every action is
+pinned to a full commit SHA, and `zizmor.yml` lints the workflows themselves.
 
 ## Prior art worth reading
 
