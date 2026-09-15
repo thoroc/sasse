@@ -7,6 +7,12 @@ _.path = ["./target/debug"]
 # The toolchain is pinned in rust-toolchain.toml and left to rustup, so mise
 # does not install a second copy of a compiler that is already present.
 "aqua:nextest-rs/nextest/cargo-nextest" = "latest"
+hk = "latest"
+"npm:markdownlint-cli" = "latest"
+# hk's config is Pkl, so pkl is not optional.
+pkl = "latest"
+shellcheck = "latest"
+shfmt = "latest"
 taplo = "latest"
 
 [tasks.build]
@@ -15,8 +21,19 @@ run = "cargo build"
 [tasks.test]
 run = "cargo nextest run"
 
-[tasks.lint]
-run = ["cargo clippy --all-targets -- -D warnings", "cargo fmt --check", "taplo fmt --check"]
+# Every linter lives in hk.pkl, so `mise run check` and the pre-commit hook run
+# exactly the same set. A check that only CI knows how to run is a check people
+# discover by having it fail.
+[tasks.check]
+run = "hk check --all"
 
-[tasks.fmt]
-run = ["cargo fmt", "taplo fmt"]
+[tasks.fix]
+run = "hk fix --all"
+
+# What CI runs, so it can be run locally in one command before pushing.
+[tasks.ci]
+depends = ["check", "test"]
+
+[tasks."hooks:install"]
+description = "Wire hk into this clone's git hooks"
+run = "hk install"

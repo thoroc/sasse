@@ -1,0 +1,143 @@
+# Every linter and the test command live in hk.pkl and mise.toml, so this
+# workflow runs the same things `mise run ci` runs locally. A check only CI
+# knows how to run is a check people discover by having it fail.
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+# Nothing is granted by default; each job asks for what it needs.
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # A superseded pull request run is wasted work, but a push to main is history
+  # and gets to finish.
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          # The append-only migration check compares against the base commit,
+          # so it needs more than a shallow clone.
+          fetch-depth: 0
+
+      # mise pins the linters, so CI uses the same versions as a developer's
+      # machine rather than whatever the runner image happens to ship.
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          version: 2026.9.8
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: check
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Lint, format and project rules
+        run: mise run check
+
+      # hk's copy of this check looks at what is staged, which is the
+      # pre-commit case and finds nothing in CI. Here the range is explicit.
+      - name: Migrations are append-only
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: ./scripts/check-migrations-append-only.sh "$BASE"
+
+      # A lockfile that was not committed makes every later run resolve
+      # different tool versions than the one that passed.
+      - name: The tool lockfile is current
+        run: |
+          mise install
+          if ! git diff --exit-code -- mise.lock; then
+            echo "::error::mise.lock is out of date. Run 'mise install' and commit it."
+            exit 1
+          fi
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          version: 2026.9.8
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: test
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Tests
+        run: mise run test
+
+      # The unit tests use fakes for git and for the gate. Five real bugs in
+      # this project were only reachable by driving the built binary against a
+      # real repository, so the binary has to at least run.
+      - name: The binary works against a real repository
+        run: |
+          cargo build --quiet
+          root="$(mktemp -d)"
+          git init -q -b main "$root/repo"
+          git -C "$root/repo" config user.email ci@example.invalid
+          git -C "$root/repo" config user.name ci
+          printf 'ok\n' > "$root/repo/marker"
+          printf 'gate = "grep -q ok marker"\n' > "$root/repo/sasse.toml"
+          git -C "$root/repo" add .
+          git -C "$root/repo" commit -qm base
+          base="$(git -C "$root/repo" rev-parse HEAD)"
+          git -C "$root/repo" switch -q -c feat/one
+          echo one > "$root/repo/one"
+          git -C "$root/repo" add .
+          git -C "$root/repo" commit -qm one
+          git -C "$root/repo" switch -q --detach "$base"
+          git -C "$root/repo" worktree add -q --detach "$root/integration" "$base"
+
+          ./target/debug/sasse --db "$root/queue.db" enqueue feat/one \
+            --repo "$root/repo" --base main
+          ./target/debug/sasse --db "$root/queue.db" tick \
+            --repo "$root/repo" --base main \
+            --integration "$root/integration" --logs "$root/logs"
+
+          landed="$(git -C "$root/repo" ls-tree --name-only main)"
+          echo "$landed"
+          echo "$landed" | grep -qx one || {
+            echo "::error::the branch did not land"
+            exit 1
+          }
+
+  # One job to require, instead of remembering to require each of the above.
+  ci:
+    name: ci
+    if: always()
+    needs: [check, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    permissions: {}
+    steps:
+      - name: Every job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          for result in $RESULTS; do
+            if [ "$result" != success ]; then
+              exit 1
+            fi
+          done

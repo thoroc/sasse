@@ -205,10 +205,45 @@ themselves (about 20MB per ten thousand failures, deliberately left alone).
 ## Development
 
 ```sh
-mise run build
+mise run hooks:install   # once per clone
+mise run ci              # what CI runs: check, then test
+mise run check           # every linter
+mise run fix             # and fix what can be fixed
 mise run test
-mise run lint
 ```
+
+Linters are declared once, in `hk.pkl`, and every route runs that same set: the
+pre-commit hook, `mise run check`, and CI. A check that only CI knows how to run
+is a check people discover by having it fail.
+
+`hk install` wires two hooks. Pre-commit fixes and checks the files being
+committed. Pre-push adds the test suite, which is deliberately not in
+pre-commit: a full suite on every commit is a hook people turn off, and with no
+remote in play, pre-push is the last gate before `main`.
+
+To run the pre-push hook by hand, close its stdin: `hk run pre-push
+</dev/null`. A pre-push hook receives the refs being pushed on stdin, so
+without that it waits for input forever and looks like a hang.
+
+Alongside the usual formatters and linters there is one project rule enforced
+rather than remembered: `scripts/check-migrations-append-only.sh` refuses a
+commit that modifies or deletes a migration that has already landed. A database
+that applied the old text will never apply the new one, because the runner
+records which versions it has run rather than what they said, so editing a
+landed migration makes the schema depend on when a queue was created. Adding a
+new migration is always the answer.
+
+Tool versions are pinned in `mise.toml` and locked in `mise.lock`, and CI
+installs them through mise rather than using whatever the runner image ships, so
+a linter cannot pass locally and fail in CI over a version difference.
+
+`.github/workflows/ci.yml` runs `mise run check` and `mise run test`, asserts
+the tool lockfile is current, and drives the built binary against a throwaway
+repository, because the unit tests use fakes for git and for the gate and
+several real bugs here were only reachable without them. Every action is pinned
+to a full commit SHA, and `zizmor.yml` lints the workflows themselves. Note that
+this repository has no remote, so those workflows do not run anywhere yet; `mise
+run ci` is the thing that runs today.
 
 ## Prior art worth reading
 

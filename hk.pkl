@@ -1,0 +1,78 @@
+amends "package://github.com/jdx/hk/releases/download/v1.57.0/hk@1.57.0#/Config.pkl"
+import "package://github.com/jdx/hk/releases/download/v1.57.0/hk@1.57.0#/Builtins.pkl"
+
+// One list of linters, used by every hook and by CI, so there is no check that
+// only one of them knows how to run.
+local linters = new Mapping<String, Step> {
+    ["cargo-fmt"] = (Builtins.cargo_fmt) {}
+
+    // Clippy rather than cargo-check: it compiles the same code and says more.
+    // --all-targets so test code is linted too, which is most of this repo.
+    ["clippy"] {
+        glob = List("**/*.rs")
+        check = new CommandSpec {
+            command = "cargo clippy --all-targets -- -D warnings"
+            effect = "write"
+        }
+        fix = new CommandSpec {
+            command = "cargo clippy --all-targets --fix --allow-dirty --allow-staged -- -D warnings"
+            effect = "write"
+        }
+    }
+
+    ["taplo"] = (Builtins.taplo) {}
+
+    // docs/adr is excluded because `adr create` owns the structure of those
+    // files and `adr check` is their gate, scoring each record out of 100. The
+    // template puts a list directly under a heading, which MD032 dislikes;
+    // reformatting tool-generated records to satisfy a general style guide is a
+    // fight with no winner, and they are meant to be immutable once accepted.
+    ["markdownlint"] = (Builtins.markdown_lint) {
+        exclude = List("docs/adr/**")
+    }
+
+    ["shellcheck"] = (Builtins.shellcheck) {}
+
+    ["shfmt"] = (Builtins.shfmt) {}
+
+    // Project rule, enforced rather than remembered: see the script for why a
+    // landed migration can never be edited.
+    ["migrations-append-only"] {
+        glob = List("migrations/*.sql")
+        check = new CommandSpec {
+            command = "./scripts/check-migrations-append-only.sh"
+            effect = "read"
+        }
+    }
+}
+
+hooks {
+    ["pre-commit"] {
+        fix = true
+        stash = "git"
+        steps = linters
+    }
+
+    // The tests are here rather than in pre-commit: a full suite on every
+    // commit is a hook people disable, and this repository has no remote, so a
+    // pre-push hook is the last gate before main.
+    ["pre-push"] {
+        steps = (linters) {
+            ["test"] {
+                check = new CommandSpec {
+                    command = "cargo nextest run"
+                    effect = "write"
+                }
+            }
+        }
+    }
+
+    ["fix"] {
+        fix = true
+        steps = linters
+    }
+
+    ["check"] {
+        steps = linters
+    }
+}

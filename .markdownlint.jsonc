@@ -1,0 +1,11 @@
+{
+  // Prose here is wrapped at 80 columns by hand. The limit is deliberately
+  // looser than that: the linter's job is to catch a paragraph nobody wrapped,
+  // not to fail a commit over a one-character overshoot. Code blocks and tables
+  // are exempt because wrapping them changes what they mean.
+  "MD013": { "line_length": 100, "code_blocks": false, "tables": false },
+
+  // Every ADR has a "### Context" and a "### Rationale", so identical headings
+  // across a document set are expected rather than a mistake.
+  "MD024": { "siblings_only": true }
+}
