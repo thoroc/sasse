@@ -1,6 +1,6 @@
 //! Keeping gate logs inside a budget.
 //!
-//! The policy is in `docs/adr/log-retention.md`. In short: the log directory has
+//! The policy is in `docs/adr/002-log-retention.md`. In short: the log directory has
 //! a hard ceiling, a passing candidate's log is removed as soon as it settles
 //! because nobody reads a green gate log, and a failure's last lines are kept on
 //! its run row so the reason survives the bytes.

@@ -378,7 +378,7 @@ impl<'a> Worker<'a> {
     }
 
     /// The gate command, read out of the base commit rather than off disk. See
-    /// `docs/adr/gate-provenance.md`.
+    /// `docs/adr/001-gate-provenance.md`.
     fn read_config(&self, base_sha: &Sha) -> Result<Config> {
         let source = self
             .git
@@ -855,7 +855,7 @@ mod tests {
     }
 
     /// A branch changing sasse.toml does not get to choose the command that
-    /// gates it. See docs/adr/gate-provenance.md.
+    /// gates it. See docs/adr/001-gate-provenance.md.
     #[test]
     fn a_candidates_own_config_is_not_used_as_the_gate() {
         let mut conn = db::open_in_memory().unwrap();

@@ -81,7 +81,7 @@ on `release`, which is asserted by a test rather than assumed. Serving two
 branches is therefore two `sasse work` processes, deliberately: a single worker
 covering several branches would reimplement inside one process an exclusion the
 lease already provides between them. The reasoning is in
-[docs/adr/base-branch-overview.md](docs/adr/base-branch-overview.md).
+[docs/adr/003-base-branch-overview.md](docs/adr/003-base-branch-overview.md).
 
 `promote` moves a waiting entry to the front, and `dequeue` takes one out.
 Neither will touch an entry that is inside a candidate: it is mid-gate, and
@@ -131,7 +131,7 @@ otherwise hold the tick open indefinitely and wedge the queue far more
 thoroughly than any missed notification. It is read from the base branch tip like
 the gate, so a queued branch cannot introduce a command the worker will run. The
 reasoning and the rejected alternatives are in
-[docs/adr/on-settle-hook.md](docs/adr/on-settle-hook.md).
+[docs/adr/004-on-settle-hook.md](docs/adr/004-on-settle-hook.md).
 
 ## Log retention
 
@@ -160,7 +160,7 @@ ceiling rather than a preference: honouring it costs bytes, not explanations.
 Measured on a gate printing roughly 330KB per run, an 8KB cap with a 32KB budget
 held at 24750 bytes across three files, where the same eight candidates would
 otherwise have left 2.6MB. The reasoning and the rejected alternatives are in
-[docs/adr/log-retention.md](docs/adr/log-retention.md).
+[docs/adr/002-log-retention.md](docs/adr/002-log-retention.md).
 
 ## Configuration
 
@@ -187,7 +187,7 @@ One consequence is worth knowing before it surprises you: a change to
 `sasse.toml` takes effect one merge *after* it lands, so a gate change wants its
 own merge rather than riding along with the code that depends on it. The
 reasoning and the rejected alternatives are in
-[docs/adr/gate-provenance.md](docs/adr/gate-provenance.md).
+[docs/adr/001-gate-provenance.md](docs/adr/001-gate-provenance.md).
 
 ## Repository layout
 

@@ -75,7 +75,7 @@ change breaks:
    candidate commit that passed. Never make a fresh merge commit after the gate.
 2. **The gate and `on_settle` are read from the base branch tip**, never from the
    candidate under test, so a queued branch cannot choose what runs on the
-   machine. See `docs/adr/gate-provenance.md`.
+   machine. See `docs/adr/001-gate-provenance.md`.
 3. **Only the entry isolated as the culprit spends an attempt.** A skipped
    batch-mate, a base that moved mid-gate, a dead worker and an interrupted gate
    all requeue for free.
