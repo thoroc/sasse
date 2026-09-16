@@ -328,7 +328,7 @@ fn main() -> Result<()> {
             let git = CommandGit::new(&repo, &repo);
 
             // The budget comes from the base branch tip, like every other
-            // setting: see docs/adr/001-gate-provenance.md.
+            // setting: see docs/adr/0001-gate-provenance.md.
             let tip = git.resolve(&target.base)?;
             let settings = read_config(&git, &tip)?;
 

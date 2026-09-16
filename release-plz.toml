@@ -8,5 +8,5 @@
 # as a consequence rather than as a separate switch, and treats the absence of a
 # tag as an initial release. Setting `publish` alongside it is an error.
 #
-# See docs/adr/005-releases.md.
+# See docs/adr/0005-releases.md.
 git_only = true

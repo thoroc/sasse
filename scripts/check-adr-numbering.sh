@@ -19,19 +19,26 @@ if [ ! -d "$dir" ]; then
     exit 0
 fi
 
-# Every record carries a three-digit prefix.
+# Every record carries a four-digit prefix, the width the `adr` skill documents.
 while IFS= read -r path; do
     name=$(basename "$path")
-    if ! printf '%s' "$name" | grep -qE '^[0-9]{3}-.+\.md$'; then
-        echo "not numbered: $path" >&2
-        echo "  rename it to NNN-$name, next number after the highest in $dir" >&2
+    if ! printf '%s' "$name" | grep -qE '^[0-9]{4}-.+\.md$'; then
+        # A record numbered to the wrong width already carries digits, so the
+        # suggestion has to replace them rather than prefix them again.
+        stem=$(printf '%s' "$name" | sed -E 's/^[0-9]+-//')
+        if printf '%s' "$name" | grep -qE '^[0-9]+-'; then
+            echo "number is not four digits: $path" >&2
+        else
+            echo "not numbered: $path" >&2
+        fi
+        echo "  rename it to NNNN-$stem, next number after the highest in $dir" >&2
         problems=$((problems + 1))
     fi
 done < <(find "$dir" -maxdepth 1 -name '*.md' | sort)
 
 # No two records share a number.
-duplicates=$(find "$dir" -maxdepth 1 -name '[0-9][0-9][0-9]-*.md' -exec basename {} \; |
-    cut -c1-3 | sort | uniq -d)
+duplicates=$(find "$dir" -maxdepth 1 -name '[0-9][0-9][0-9][0-9]-*.md' -exec basename {} \; |
+    cut -c1-4 | sort | uniq -d)
 if [ -n "$duplicates" ]; then
     echo "duplicate numbers: $(printf '%s' "$duplicates" | tr '\n' ' ')" >&2
     problems=$((problems + 1))
