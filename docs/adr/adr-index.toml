@@ -57,3 +57,16 @@
       from = "proposed"
       to = "accepted"
       at = 2026-09-15T12:46:07.060614Z
+  [decisions.releases]
+    file = "releases.md"
+    type = "feat"
+    status = "accepted"
+    created = "2026-09-16"
+    author = "thoroc"
+    tags = []
+    description = "Tagged GitHub releases with prebuilt binaries, driven by release-plz in git-only mode, using GITHUB_TOKEN alone"
+
+    [[decisions.releases.history]]
+      from = "proposed"
+      to = "accepted"
+      at = 2026-09-16T14:14:11.337682Z
