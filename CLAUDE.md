@@ -58,6 +58,14 @@ check`; an empty Options Considered section has recorded nothing. `docs/adr/` is
 excluded from markdownlint on purpose, because the `adr` template owns that
 structure.
 
+**Decision records are numbered `NNN-slug.md`.** The `adr` CLI does not know
+about numbers and writes `<slug>.md`, so rename the file and point its `file`
+field in `adr-index.toml` at the new name; the CLI is filename-agnostic once
+they agree. `scripts/check-adr-numbering.sh` refuses the commit otherwise, and
+also catches a duplicate number or an index entry naming a file that is not
+there. Numbers need only be unique, not contiguous: a gap is what superseding a
+record leaves, and closing it would renumber decisions other documents cite.
+
 **Everything lands on `main` through a pull request**, including for the owner.
 Direct pushes are refused and `ci` is the required check. Work on a
 `feat/`/`fix/`/`docs/` branch, conventional commits, one concern per commit.

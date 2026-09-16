@@ -60,6 +60,10 @@ gets an ADR under `docs/adr/`, created with the `adr` CLI and scored by `adr
 check`. A record whose Options Considered section is empty has recorded nothing:
 the value is in why the other paths lost.
 
+Records are numbered `NNN-slug.md`, chronologically. The CLI writes `<slug>.md`,
+so rename it and update the `file` field in `adr-index.toml` to match;
+`scripts/check-adr-numbering.sh` will tell you if you forget.
+
 An accepted ADR is immutable except for its status. Supersede rather than edit.
 
 ## Migrations
