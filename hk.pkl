@@ -54,8 +54,8 @@ hooks {
     }
 
     // The tests are here rather than in pre-commit: a full suite on every
-    // commit is a hook people disable, and this repository has no remote, so a
-    // pre-push hook is the last gate before main.
+    // commit is a hook people disable. It is the last check before a failure
+    // becomes CI's problem, and not a substitute for CI: see CONTRIBUTING.md.
     ["pre-push"] {
         steps = (linters) {
             ["test"] {
