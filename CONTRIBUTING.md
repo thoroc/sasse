@@ -41,8 +41,9 @@ be a dead end. Branches are deleted on merge.
 
 A branch must be up to date with `main` before it merges. That is the naive
 serialisation this project exists to replace, and it is here only because
-GitHub's own merge queue is not enabled and sasse is not wired into GitHub. See
-`docs/adr/003-base-branch-overview.md` for the same argument in another context.
+GitHub's own merge queue is not enabled and sasse is not wired into GitHub.
+See `docs/adr/0003-base-branch-overview.md` for the same argument in another
+context.
 
 ## Commits
 
@@ -60,9 +61,9 @@ gets an ADR under `docs/adr/`, created with the `adr` CLI and scored by `adr
 check`. A record whose Options Considered section is empty has recorded nothing:
 the value is in why the other paths lost.
 
-Records are numbered `NNN-slug.md`, chronologically. The CLI writes `<slug>.md`,
-so rename it and update the `file` field in `adr-index.toml` to match;
-`scripts/check-adr-numbering.sh` will tell you if you forget.
+Records are numbered `NNNN-slug.md`, chronologically. The CLI writes
+`<slug>.md`, so rename it and update the `file` field in `adr-index.toml` to
+match; `scripts/check-adr-numbering.sh` will tell you if you forget.
 
 An accepted ADR is immutable except for its status. Supersede rather than edit.
 

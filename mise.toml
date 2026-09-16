@@ -37,7 +37,7 @@ depends = ["check", "test"]
 
 # Bumps the version and writes the changelog from the conventional commits. The
 # result is committed and opened as an ordinary pull request, like everything
-# else: see docs/adr/005-releases.md for why a bot does not do this.
+# else: see docs/adr/0005-releases.md for why a bot does not do this.
 [tasks."release:prepare"]
 description = "Bump the version and update CHANGELOG.md from the commits"
 run = "release-plz update"

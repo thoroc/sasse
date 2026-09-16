@@ -58,7 +58,7 @@ check`; an empty Options Considered section has recorded nothing. `docs/adr/` is
 excluded from markdownlint on purpose, because the `adr` template owns that
 structure.
 
-**Decision records are numbered `NNN-slug.md`.** The `adr` CLI does not know
+**Decision records are numbered `NNNN-slug.md`.** The `adr` CLI does not know
 about numbers and writes `<slug>.md`, so rename the file and point its `file`
 field in `adr-index.toml` at the new name; the CLI is filename-agnostic once
 they agree. `scripts/check-adr-numbering.sh` refuses the commit otherwise, and
@@ -83,7 +83,7 @@ change breaks:
    candidate commit that passed. Never make a fresh merge commit after the gate.
 2. **The gate and `on_settle` are read from the base branch tip**, never from the
    candidate under test, so a queued branch cannot choose what runs on the
-   machine. See `docs/adr/001-gate-provenance.md`.
+   machine. See `docs/adr/0001-gate-provenance.md`.
 3. **Only the entry isolated as the culprit spends an attempt.** A skipped
    batch-mate, a base that moved mid-gate, a dead worker and an interrupted gate
    all requeue for free.

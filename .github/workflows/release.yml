@@ -3,7 +3,7 @@
 # It is one workflow on purpose. GITHUB_TOKEN cannot trigger further workflow
 # runs, so a pipeline that pushed a tag and expected a separate build workflow to
 # start would tag and then never build. Doing it all in one run needs no second
-# credential. See docs/adr/005-releases.md.
+# credential. See docs/adr/0005-releases.md.
 name: release
 
 on:
