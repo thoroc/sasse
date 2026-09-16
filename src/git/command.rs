@@ -8,6 +8,41 @@ use eyre::{Result, WrapErr, eyre};
 
 use super::{Git, MergeOutcome, RefUpdate, Sha, Worktree};
 
+/// The variables through which an ambient environment names a repository.
+///
+/// `-C` sets the directory git starts from, and every one of these outranks
+/// it: with `GIT_DIR` set, git never looks at the directory at all. So every
+/// invocation here would operate on whichever repository the environment
+/// happened to name, not the one it was handed.
+///
+/// That environment is not exotic. git exports these to its own hooks, and
+/// sasse is run from a pre-push hook, from a gate command git started, and
+/// from an `on_settle` hook, so the queue can find itself pointed at a
+/// repository nobody asked about.
+const AMBIENT_REPOSITORY: [&str; 7] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+];
+
+/// A git invocation in `dir`, deaf to the environment's idea of which
+/// repository it is in.
+///
+/// The only way to reach git from this module, so production and the tests
+/// cannot disagree about what has been cleared.
+fn git_in(dir: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir);
+    for key in AMBIENT_REPOSITORY {
+        command.env_remove(key);
+    }
+    command
+}
+
 pub struct CommandGit {
     /// The repository whose refs are read and moved.
     repo: PathBuf,
@@ -30,9 +65,7 @@ impl CommandGit {
 
     /// Run git and hand back the outcome, whatever it was.
     fn run<S: AsRef<OsStr>>(&self, dir: &Path, args: &[S]) -> Result<Output> {
-        Command::new("git")
-            .arg("-C")
-            .arg(dir)
+        git_in(dir)
             .args(args)
             .output()
             .wrap_err_with(|| format!("running git in {}", dir.display()))
@@ -214,8 +247,6 @@ fn describe<S: AsRef<OsStr>>(args: &[S]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
-
     use tempfile::TempDir;
 
     use super::*;
@@ -232,12 +263,7 @@ mod tests {
     }
 
     fn run(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .unwrap();
+        let out = git_in(dir).args(args).output().unwrap();
         assert!(
             out.status.success(),
             "git {} failed: {}",
@@ -247,12 +273,7 @@ mod tests {
     }
 
     fn sha(dir: &Path, rev: &str) -> Sha {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(["rev-parse", rev])
-            .output()
-            .unwrap();
+        let out = git_in(dir).args(["rev-parse", rev]).output().unwrap();
         Sha::parse(&String::from_utf8_lossy(&out.stdout)).unwrap()
     }
 
@@ -311,6 +332,29 @@ mod tests {
             base,
             clean,
             conflicting,
+        }
+    }
+
+    /// Every variable through which the environment could name a repository is
+    /// cleared, so `-C` decides where the invocation lands and nothing else
+    /// does. Asserted on the command rather than by setting these for real,
+    /// because the process environment is shared by every test running beside
+    /// this one.
+    #[test]
+    fn git_runs_deaf_to_an_ambient_repository() {
+        let command = git_in(Path::new("/nonexistent"));
+
+        let cleared: Vec<String> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+
+        for key in AMBIENT_REPOSITORY {
+            assert!(
+                cleared.contains(&key.to_string()),
+                "{key} is still inherited"
+            );
         }
     }
 
