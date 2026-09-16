@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Decision records are numbered, and the index has to agree with the filenames.
 #
-# The `adr` CLI has no notion of a number: `adr create` writes `<slug>.md`. So a
-# new record arrives unnumbered and this is what notices, rather than a
-# convention that quietly decays. Renaming the file and updating the `file`
-# field in the index is the fix; the CLI is filename-agnostic once they match.
+# A new record is written by hand and arrives unnumbered, so this is what
+# notices rather than a convention that quietly decays. Renaming the file and
+# updating the `file` field in the index is the fix, and nothing else cares
+# which name a record goes by so long as the two agree.
 #
 # Numbers need only be unique, not contiguous. A gap is what superseding or
 # abandoning a record leaves behind, and closing it would renumber decisions
@@ -19,7 +19,7 @@ if [ ! -d "$dir" ]; then
     exit 0
 fi
 
-# Every record carries a four-digit prefix, the width the `adr` skill documents.
+# Every record carries a four-digit prefix, the width the adr skill documents.
 while IFS= read -r path; do
     name=$(basename "$path")
     if ! printf '%s' "$name" | grep -qE '^[0-9]{4}-.+\.md$'; then
@@ -44,8 +44,9 @@ if [ -n "$duplicates" ]; then
     problems=$((problems + 1))
 fi
 
-# The index points at files that exist. A record the index cannot find is one
-# `adr check` will refuse to score.
+# The index points at files that exist. A record the index cannot find is a
+# record nothing scores, which would quietly disable the completeness gate
+# rather than fail it.
 if [ -f "$index" ]; then
     while IFS= read -r file; do
         if [ ! -f "$dir/$file" ]; then

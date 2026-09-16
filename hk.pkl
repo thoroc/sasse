@@ -22,11 +22,12 @@ local linters = new Mapping<String, Step> {
 
     ["taplo"] = (Builtins.taplo) {}
 
-    // docs/adr is excluded because `adr create` owns the structure of those
-    // files and `adr check` is their gate, scoring each record out of 100. The
-    // template puts a list directly under a heading, which MD032 dislikes;
-    // reformatting tool-generated records to satisfy a general style guide is a
-    // fight with no winner, and they are meant to be immutable once accepted.
+    // docs/adr is excluded because those files follow a fixed section structure
+    // and adr-completeness below is their gate, scoring each record out of 100.
+    // The records put a list directly under a heading, which MD032 dislikes;
+    // reformatting them to satisfy a general style guide is a fight with no
+    // winner, and they are immutable once accepted. That exclusion is only
+    // defensible while the gate it defers to actually runs.
     ["markdownlint"] = (Builtins.markdown_lint) {
         exclude = List("docs/adr/**")
     }
@@ -35,12 +36,23 @@ local linters = new Mapping<String, Step> {
 
     ["shfmt"] = (Builtins.shfmt) {}
 
-    // The adr CLI writes unnumbered filenames, so a new record arrives without
-    // its prefix. This notices instead of the convention decaying.
+    // A new record is written by hand and arrives without its number prefix.
+    // This notices instead of the convention decaying.
     ["adr-numbering"] {
         glob = List("docs/adr/**")
         check = new CommandSpec {
             command = "./scripts/check-adr-numbering.sh"
+            effect = "read"
+        }
+    }
+
+    // A record has to have recorded a decision. The scoring is vendored from
+    // the `adr` CLI that used to own it, whose repository no longer exists;
+    // see the script for the rules and the one place it deliberately differs.
+    ["adr-completeness"] {
+        glob = List("docs/adr/**")
+        check = new CommandSpec {
+            command = "./scripts/check-adr-completeness.sh"
             effect = "read"
         }
     }
