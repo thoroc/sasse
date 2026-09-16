@@ -53,16 +53,25 @@ always the answer. `scripts/check-migrations-append-only.sh` refuses the commit,
 and CI checks again against the pull request's base.
 
 **An accepted ADR is immutable except for its status.** Supersede rather than
-edit. New records go under `docs/adr/` via the `adr` CLI and are scored by `adr
-check`; an empty Options Considered section has recorded nothing. `docs/adr/` is
-excluded from markdownlint on purpose, because the `adr` template owns that
-structure.
+edit. New records go under `docs/adr/` and are scored out of 100 by
+`scripts/check-adr-completeness.sh`, which refuses the commit below 80. It wants
+a Problem Statement or a Context beneath it, a Chosen Solution, a Rationale and
+an Impact Assessment that says something other than "none", with no unfilled
+`<!-- -->` placeholders left behind. An empty Options Considered section has
+recorded nothing either, though that is a house expectation the score does not
+measure. The existing records show the structure, and `docs/adr/` is excluded
+from markdownlint because they follow it rather than a general style guide.
 
-**Decision records are numbered `NNNN-slug.md`.** The `adr` CLI does not know
-about numbers and writes `<slug>.md`, so rename the file and point its `file`
-field in `adr-index.toml` at the new name; the CLI is filename-agnostic once
-they agree. `scripts/check-adr-numbering.sh` refuses the commit otherwise, and
-also catches a duplicate number or an index entry naming a file that is not
+The scoring used to belong to an `adr` CLI. That tool's repository no longer
+exists and the only copy of its source is a local bundle, so the rules were
+vendored here rather than left depending on one unbacked file. Do not reach for
+`adr create` or `adr check`: neither is installed and neither is needed.
+
+**Decision records are numbered `NNNN-slug.md`.** A new record is written by
+hand and arrives without a number, so name the file and point its `file` field
+in `adr-index.toml` at it; nothing cares which name a record goes by so long as
+the two agree. `scripts/check-adr-numbering.sh` refuses the commit otherwise,
+and also catches a duplicate number or an index entry naming a file that is not
 there. Numbers need only be unique, not contiguous: a gap is what superseding a
 record leaves, and closing it would renumber decisions other documents cite.
 

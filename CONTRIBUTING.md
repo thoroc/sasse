@@ -57,13 +57,16 @@ in a year.
 ## Decisions
 
 A choice with rejected alternatives that someone could reasonably re-propose
-gets an ADR under `docs/adr/`, created with the `adr` CLI and scored by `adr
-check`. A record whose Options Considered section is empty has recorded nothing:
-the value is in why the other paths lost.
+gets an ADR under `docs/adr/`, scored out of 100 by
+`scripts/check-adr-completeness.sh` and refused below 80. Copy the structure
+from an existing record; `0001-gate-provenance.md` is the shortest of them. A
+record whose Options Considered section is empty has recorded nothing: the value
+is in why the other paths lost, and that part is on you rather than on the
+score, which does not measure it.
 
-Records are numbered `NNNN-slug.md`, chronologically. The CLI writes
-`<slug>.md`, so rename it and update the `file` field in `adr-index.toml` to
-match; `scripts/check-adr-numbering.sh` will tell you if you forget.
+Records are numbered `NNNN-slug.md`, chronologically. Add the number yourself
+and point the `file` field in `adr-index.toml` at the file;
+`scripts/check-adr-numbering.sh` will tell you if you forget.
 
 An accepted ADR is immutable except for its status. Supersede rather than edit.
 
