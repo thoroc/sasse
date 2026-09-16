@@ -323,4 +323,4 @@ pinned to a full commit SHA, and `zizmor.yml` lints the workflows themselves.
 
 ## Licence
 
-MIT
+MIT. See [LICENSE](LICENSE).
