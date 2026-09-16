@@ -35,6 +35,16 @@ local linters = new Mapping<String, Step> {
 
     ["shfmt"] = (Builtins.shfmt) {}
 
+    // The adr CLI writes unnumbered filenames, so a new record arrives without
+    // its prefix. This notices instead of the convention decaying.
+    ["adr-numbering"] {
+        glob = List("docs/adr/**")
+        check = new CommandSpec {
+            command = "./scripts/check-adr-numbering.sh"
+            effect = "read"
+        }
+    }
+
     // Project rule, enforced rather than remembered: see the script for why a
     // landed migration can never be edited.
     ["migrations-append-only"] {
