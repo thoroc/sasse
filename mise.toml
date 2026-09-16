@@ -9,6 +9,7 @@ _.path = ["./target/debug"]
 "aqua:nextest-rs/nextest/cargo-nextest" = "latest"
 hk = "latest"
 "npm:markdownlint-cli" = "latest"
+release-plz = "latest"
 # hk's config is Pkl, so pkl is not optional.
 pkl = "latest"
 shellcheck = "latest"
@@ -33,6 +34,13 @@ run = "hk fix --all"
 # What CI runs, so it can be run locally in one command before pushing.
 [tasks.ci]
 depends = ["check", "test"]
+
+# Bumps the version and writes the changelog from the conventional commits. The
+# result is committed and opened as an ordinary pull request, like everything
+# else: see docs/adr/releases.md for why a bot does not do this.
+[tasks."release:prepare"]
+description = "Bump the version and update CHANGELOG.md from the commits"
+run = "release-plz update"
 
 [tasks."hooks:install"]
 description = "Wire hk into this clone's git hooks"

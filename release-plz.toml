@@ -1,0 +1,12 @@
+[workspace]
+# Versions come from git tags, not from crates.io.
+#
+# The obvious setting for "do not publish" is `publish = false`, and it is the
+# wrong one here: with it, release-plz still asks the cargo registry what the
+# latest release is, and this crate has never been published, so that question
+# has no answer. `git_only` reads existing tags instead, skips `cargo publish`
+# as a consequence rather than as a separate switch, and treats the absence of a
+# tag as an initial release. Setting `publish` alongside it is an error.
+#
+# See docs/adr/releases.md.
+git_only = true

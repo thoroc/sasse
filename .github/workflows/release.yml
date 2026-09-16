@@ -1,0 +1,110 @@
+# One workflow does the whole release: tag, build, upload.
+#
+# It is one workflow on purpose. GITHUB_TOKEN cannot trigger further workflow
+# runs, so a pipeline that pushed a tag and expected a separate build workflow to
+# start would tag and then never build. Doing it all in one run needs no second
+# credential. See docs/adr/releases.md.
+name: release
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  # Deliberately not cancelled. A release interrupted between tagging and
+  # uploading leaves a tag with no binaries, which is worse than waiting.
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      created: ${{ steps.release.outputs.releases_created }}
+      tag: ${{ steps.pick.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The changelog and the tag history are both computed from the full
+          # history, and git-only mode needs the tags.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # No-ops unless the version in Cargo.toml has no tag, which only happens
+      # on the merge of a `mise run release:prepare` pull request.
+      - id: release
+        uses: release-plz/action@c18510d384e6f6d444fc5c051838e6adceb6c8c0 # v0.5.137
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: pick
+        name: Which tag was cut
+        env:
+          RELEASES: ${{ steps.release.outputs.releases }}
+        run: |
+          tag=$(printf '%s' "${RELEASES:-[]}" | jq -r '.[0].tag // empty')
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "tag: ${tag:-none}"
+
+  binaries:
+    needs: tag
+    if: needs.tag.outputs.created == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    strategy:
+      # One target failing must not cancel the other. A release with half its
+      # binaries can be completed by re-running the failed leg; a cancelled one
+      # cannot be told apart from a broken one.
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    steps:
+      # The tag, not the branch: main may already have moved on.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.tag.outputs.tag }}
+          persist-credentials: false
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: release-${{ matrix.target }}
+
+      # Each runner builds for its own architecture, so there is no
+      # cross-compilation to arrange.
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        env:
+          TAG: ${{ needs.tag.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          name="sasse-$TAG-$TARGET"
+          tar -czf "$name.tar.gz" -C target/release sasse
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          ls -l "$name.tar.gz" "$name.tar.gz.sha256"
+
+      # --clobber so re-running a failed leg replaces its own artefacts rather
+      # than erroring on a name that already exists.
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.tag.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          name="sasse-$TAG-$TARGET"
+          gh release upload "$TAG" "$name.tar.gz" "$name.tar.gz.sha256" --clobber

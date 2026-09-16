@@ -123,6 +123,41 @@ checksum = "sha256:8550a00fcf027335e42c5e2cd553b88e98845408cb1880b3e3d1860caf46d
 url = "https://github.com/apple/pkl/releases/download/0.32.1/pkl-windows-amd64.exe"
 url_api = "https://api.github.com/repos/apple/pkl/releases/assets/487426668"
 
+[[tools.release-plz]]
+version = "0.3.164"
+backend = "aqua:release-plz/release-plz"
+specifiers = ["latest"]
+
+[tools.release-plz."platforms.linux-arm64"]
+checksum = "sha256:392aafa149620b9613cae04dea367adde758cf0e578f3000d72124285bc349ef"
+url = "https://github.com/release-plz/release-plz/releases/download/release-plz-v0.3.164/release-plz-aarch64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/release-plz/release-plz/releases/assets/552687334"
+
+[tools.release-plz."platforms.linux-arm64-musl"]
+checksum = "sha256:62563598c1e71b6e477d204823c2525286eb277b311b1045487db805e5623365"
+url = "https://github.com/release-plz/release-plz/releases/download/release-plz-v0.3.164/release-plz-aarch64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/release-plz/release-plz/releases/assets/552689874"
+
+[tools.release-plz."platforms.linux-x64"]
+checksum = "sha256:31ab94f55f47f9f0802d08b3dc805482bbbdd0475c6e17adfdb2bc023bafb5ab"
+url = "https://github.com/release-plz/release-plz/releases/download/release-plz-v0.3.164/release-plz-x86_64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/release-plz/release-plz/releases/assets/552687990"
+
+[tools.release-plz."platforms.linux-x64-musl"]
+checksum = "sha256:d258f309d07889c8321d889e847657c879fd1380b9bc27c47038a017e220cd82"
+url = "https://github.com/release-plz/release-plz/releases/download/release-plz-v0.3.164/release-plz-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/release-plz/release-plz/releases/assets/552691585"
+
+[tools.release-plz."platforms.macos-arm64"]
+checksum = "sha256:9aa798c9d9e47b221221ce35c5e75295f57e9216a9b13e4dcb2dc499c16d3250"
+url = "https://github.com/release-plz/release-plz/releases/download/release-plz-v0.3.164/release-plz-aarch64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/release-plz/release-plz/releases/assets/552689839"
+
+[tools.release-plz."platforms.windows-x64"]
+checksum = "sha256:8fc2e0786a2c0da9d8b37f3ed6080e57f46b1d06ddf471b2bbf8720e3990b311"
+url = "https://github.com/release-plz/release-plz/releases/download/release-plz-v0.3.164/release-plz-x86_64-pc-windows-msvc.tar.gz"
+url_api = "https://api.github.com/repos/release-plz/release-plz/releases/assets/552698309"
+
 [[tools.shellcheck]]
 version = "0.11.0"
 backend = "aqua:koalaman/shellcheck"
