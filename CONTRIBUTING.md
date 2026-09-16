@@ -42,7 +42,7 @@ be a dead end. Branches are deleted on merge.
 A branch must be up to date with `main` before it merges. That is the naive
 serialisation this project exists to replace, and it is here only because
 GitHub's own merge queue is not enabled and sasse is not wired into GitHub. See
-`docs/adr/base-branch-overview.md` for the same argument in another context.
+`docs/adr/003-base-branch-overview.md` for the same argument in another context.
 
 ## Commits
 

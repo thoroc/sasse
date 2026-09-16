@@ -6,7 +6,7 @@
 
 [decisions]
   [decisions.base-branch-overview]
-    file = "base-branch-overview.md"
+    file = "003-base-branch-overview.md"
     type = "feat"
     status = "accepted"
     created = "2026-09-15"
@@ -19,7 +19,7 @@
       to = "accepted"
       at = 2026-09-15T09:54:51.863621Z
   [decisions.gate-provenance]
-    file = "gate-provenance.md"
+    file = "001-gate-provenance.md"
     type = "feat"
     status = "accepted"
     created = "2026-09-14"
@@ -32,7 +32,7 @@
       to = "accepted"
       at = 2026-09-14T20:22:30.421101Z
   [decisions.log-retention]
-    file = "log-retention.md"
+    file = "002-log-retention.md"
     type = "feat"
     status = "accepted"
     created = "2026-09-15"
@@ -45,7 +45,7 @@
       to = "accepted"
       at = 2026-09-15T08:29:57.408951Z
   [decisions.on-settle-hook]
-    file = "on-settle-hook.md"
+    file = "004-on-settle-hook.md"
     type = "feat"
     status = "accepted"
     created = "2026-09-15"
@@ -58,7 +58,7 @@
       to = "accepted"
       at = 2026-09-15T12:46:07.060614Z
   [decisions.releases]
-    file = "releases.md"
+    file = "005-releases.md"
     type = "feat"
     status = "accepted"
     created = "2026-09-16"

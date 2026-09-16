@@ -1,6 +1,6 @@
 //! Applying the log budget.
 //!
-//! The policy and the reasoning are in `docs/adr/log-retention.md`. This is the
+//! The policy and the reasoning are in `docs/adr/002-log-retention.md`. This is the
 //! part that joins the two halves: the database knows which candidate a log
 //! belongs to and how its gate run ended, the filesystem knows how big the log
 //! is, and [`crate::logs::plan`] decides what goes.

@@ -1,6 +1,6 @@
 //! Telling someone when an entry settles.
 //!
-//! The reasoning is in `docs/adr/on-settle-hook.md`. In short: a branch that is
+//! The reasoning is in `docs/adr/004-on-settle-hook.md`. In short: a branch that is
 //! queued and then evicted looks, from outside, exactly like one still waiting,
 //! because neither has landed. The hook removes that ambiguity.
 //!

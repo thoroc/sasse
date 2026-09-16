@@ -2,7 +2,7 @@
 //!
 //! Read from `sasse.toml` in the repository, and specifically from the base
 //! branch tip rather than from the candidate under test. See
-//! `docs/adr/gate-provenance.md`: the worker runs the gate on a developer's own
+//! `docs/adr/001-gate-provenance.md`: the worker runs the gate on a developer's own
 //! machine as their own user, so taking the command from a commit that has not
 //! yet passed the queue would make enqueuing a branch equivalent to granting it
 //! code execution.
@@ -56,7 +56,7 @@ pub struct Config {
     ///
     /// Optional, and absent means nothing is run. Read from the base branch tip
     /// like the gate, so a queued branch cannot introduce a command the worker
-    /// will execute. See `docs/adr/on-settle-hook.md`.
+    /// will execute. See `docs/adr/004-on-settle-hook.md`.
     #[serde(default)]
     pub on_settle: Option<String>,
 }

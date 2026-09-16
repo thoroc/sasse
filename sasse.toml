@@ -1,5 +1,5 @@
 # sasse gates itself with this. Read from the base branch tip, never from the
-# candidate under test: see docs/adr/gate-provenance.md.
+# candidate under test: see docs/adr/001-gate-provenance.md.
 gate = "cargo test --quiet"
 
 # Most entries in one candidate. Larger lands more per gate run when everything
@@ -12,7 +12,7 @@ max_attempts = 3
 
 # Most bytes the gate log directory may hold. A hard ceiling: a passing
 # candidate's log goes as soon as it settles, then the oldest failures go until
-# the directory is under budget. See docs/adr/log-retention.md.
+# the directory is under budget. See docs/adr/002-log-retention.md.
 log_budget = "200MB"
 
 # Most bytes of any one gate log. Beyond this the log keeps its head and its
@@ -21,6 +21,6 @@ max_log_size = "2MB"
 
 # Run once for each entry that merges or is evicted. Optional; left unset here
 # because sasse's own queue has nobody to notify. The branch, outcome, attempts
-# and eviction reason arrive in the environment. See docs/adr/on-settle-hook.md.
+# and eviction reason arrive in the environment. See docs/adr/004-on-settle-hook.md.
 #
 # on_settle = "terminal-notifier -message \"$SASSE_BRANCH $SASSE_OUTCOME\""
